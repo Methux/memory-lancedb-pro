@@ -691,8 +691,17 @@ const memoryLanceDBProPlugin = {
 
       const numbered = texts.map((t, i) => `${i + 1}. ${t}`).join("\n");
       const systemPrompt =
-        `判断消息是否值得长期记住。保留：重要事实、决策、偏好、关键数据、人物信息。` +
-        `不保留：闲聊、问候、确认语气词、单纯提问。` +
+        `判断消息是否值得长期记住。\n` +
+        `保留：人物具体信息（生日/电话/住址/职业）、明确决策、个人偏好、关键数据和数字。\n` +
+        `不保留：闲聊对话片段、单纯提问、确认语气词、讨论过程中的临时发言、指令性话语。\n` +
+        `分类规则：涉及具体人物属性(生日/电话/住址/公司/职业/宠物)→entity，个人喜好→preference，做了什么决定→decision，其余事实→fact。\n` +
+        `示例：\n` +
+        `- "Rex的生日是3月15号" → keep:true, cat:entity\n` +
+        `- "Mike在上海浦东开了一家咖啡馆" → keep:true, cat:entity\n` +
+        `- "我最喜欢的颜色是蓝色" → keep:true, cat:preference\n` +
+        `- "你想怎么迁移，你先说说" → keep:false（对话片段）\n` +
+        `- "512和1024区别大吗" → keep:false（提问）\n` +
+        `- "好的我知道了" → keep:false（确认）\n` +
         `回答JSON: {"results":[{"i":序号,"keep":true/false,"cat":"fact"|"decision"|"preference"|"entity"}]}`;
 
       try {
@@ -910,7 +919,7 @@ const memoryLanceDBProPlugin = {
               );
             }
 
-            if (existing.length > 0 && existing[0].score > 0.95) {
+            if (existing.length > 0 && existing[0].score > 0.90) {
               continue;
             }
 
