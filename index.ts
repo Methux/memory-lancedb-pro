@@ -831,17 +831,20 @@ const memoryLanceDBProPlugin = {
           // Filter for capturable content: regex fast path + LLM fallback
           const regexMatched = texts.filter((text) => text && shouldCapture(text));
           // Strip metadata headers + injected blocks before LLM evaluation
-          const metadataPattern = /^(Conversation info|Sender) \(untrusted metadata\):[\s\S]*?\n\s*\n/gim;
+          const metadataPlainPattern = /^(Conversation info|Sender) \(untrusted metadata\):[\s\S]*?\n\s*\n/gim;
+          const metadataJsonPattern = /^(Conversation info|Sender) \(untrusted metadata\):\s*```json[\s\S]*?```\s*/gim;
           const relevantMemPattern = /<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g;
-          const heartbeatPattern = /^Read HEARTBEAT\.md if it exists/;
           const regexMissed = texts
             .map((text) => text
-              .replace(metadataPattern, "")
+              .replace(metadataJsonPattern, "")
+              .replace(metadataPlainPattern, "")
               .replace(relevantMemPattern, "")
               .trim())
             .filter(
               (text) => text && !shouldCapture(text) && text.length >= 4 && text.length <= 500
-                && !heartbeatPattern.test(text)
+                && !/^Read HEARTBEAT\.md if it exists/.test(text)
+                && !/^Context nearing compaction/i.test(text)
+                && !/^\[cron:[0-9a-f-]+/.test(text)
                 && !(text.startsWith("<") && text.includes("</"))
                 && !(text.includes("**") && text.includes("\n-"))
                 && !CAPTURE_EXCLUDE_PATTERNS.some((r) => r.test(text)),
