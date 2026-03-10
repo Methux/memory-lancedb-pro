@@ -302,7 +302,7 @@
           },
           "model": {
             "type": "string",
-            "default": "qwen3:4b",
+            "default": "qwen3:8b",
             "description": "Model ID to use for capture judgment"
           },
           "timeoutMs": {
@@ -513,7 +513,7 @@
     },
     "autoCaptureLLM.model": {
       "label": "LLM Model",
-      "placeholder": "qwen3-v1-4b",
+      "placeholder": "qwen3:8b",
       "help": "Model ID for capture judgment",
       "advanced": true
     },

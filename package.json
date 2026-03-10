@@ -26,8 +26,10 @@
   "license": "MIT",
   "dependencies": {
     "@lancedb/lancedb": "^0.26.2",
+    "@modelcontextprotocol/sdk": "^1.12.0",
     "@sinclair/typebox": "0.34.48",
-    "openai": "^6.21.0"
+    "openai": "^6.21.0",
+    "zod": "^3.25.0"
   },
   "openclaw": {
     "extensions": [
@@ -35,7 +37,8 @@
     ]
   },
   "scripts": {
-    "test": "node test/cli-smoke.mjs"
+    "test": "node test/cli-smoke.mjs",
+    "mcp": "node --import jiti/register src/mcp-server.ts"
   },
   "devDependencies": {
     "commander": "^14.0.0",

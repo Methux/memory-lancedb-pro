@@ -4,7 +4,6 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { readFile, readdir, writeFile, mkdir, appendFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -20,96 +19,7 @@ import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { AccessTracker } from "./src/access-tracker.js";
 import { createMemoryCLI } from "./cli.js";
-
-// ============================================================================
-// Configuration & Types
-// ============================================================================
-
-interface PluginConfig {
-  embedding: {
-    provider: "openai-compatible";
-    apiKey: string;
-    model?: string;
-    baseURL?: string;
-    dimensions?: number;
-    taskQuery?: string;
-    taskPassage?: string;
-    normalized?: boolean;
-  };
-  dbPath?: string;
-  autoCapture?: boolean;
-  autoRecall?: boolean;
-  autoRecallMinLength?: number;
-  autoRecallMinRepeated?: number;
-  captureAssistant?: boolean;
-  retrieval?: {
-    mode?: "hybrid" | "vector";
-    vectorWeight?: number;
-    bm25Weight?: number;
-    minScore?: number;
-    rerank?: "cross-encoder" | "lightweight" | "none";
-    candidatePoolSize?: number;
-    rerankApiKey?: string;
-    rerankModel?: string;
-    rerankEndpoint?: string;
-    rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone";
-    recencyHalfLifeDays?: number;
-    recencyWeight?: number;
-    filterNoise?: boolean;
-    lengthNormAnchor?: number;
-    hardMinScore?: number;
-    timeDecayHalfLifeDays?: number;
-    reinforcementFactor?: number;
-    maxHalfLifeMultiplier?: number;
-  };
-  scopes?: {
-    default?: string;
-    definitions?: Record<string, { description: string }>;
-    agentAccess?: Record<string, string[]>;
-  };
-  enableManagementTools?: boolean;
-  sessionMemory?: { enabled?: boolean; messageCount?: number };
-  mdMirror?: { enabled?: boolean; dir?: string };
-  autoCaptureLLM?: {
-    enabled?: boolean;
-    endpoint?: string;   // default: "http://127.0.0.1:1234/v1/chat/completions"
-    model?: string;      // default: "qwen3-v1-4b"
-    timeoutMs?: number;  // default: 3000
-  };
-}
-
-// ============================================================================
-// Default Configuration
-// ============================================================================
-
-function getDefaultDbPath(): string {
-  const home = homedir();
-  return join(home, ".openclaw", "memory", "lancedb-pro");
-}
-
-function resolveEnvVars(value: string): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
-    const envValue = process.env[envVar];
-    if (!envValue) {
-      throw new Error(`Environment variable ${envVar} is not set`);
-    }
-    return envValue;
-  });
-}
-
-function parsePositiveInt(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    return Math.floor(value);
-  }
-  if (typeof value === "string") {
-    const s = value.trim();
-    if (!s) return undefined;
-    const resolved = resolveEnvVars(s);
-    const n = Number(resolved);
-    if (Number.isFinite(n) && n > 0) return Math.floor(n);
-  }
-  return undefined;
-}
+import { type PluginConfig, parsePluginConfig, getDefaultDbPath, resolveEnvVars, parsePositiveInt } from "./src/config.js";
 
 // ============================================================================
 // Capture & Category Detection (from old plugin)
@@ -686,7 +596,7 @@ const memoryLanceDBProPlugin = {
       llmConfig: NonNullable<PluginConfig["autoCaptureLLM"]>,
     ): Promise<LLMJudgeResult[]> {
       const endpoint = llmConfig.endpoint || "http://127.0.0.1:11434/api/chat";
-      const model = llmConfig.model || "qwen3:4b";
+      const model = llmConfig.model || "qwen3:8b";
       const timeoutMs = llmConfig.timeoutMs || 10000;
 
       const numbered = texts.map((t, i) => `${i + 1}. ${t}`).join("\n");
@@ -1226,162 +1136,5 @@ const memoryLanceDBProPlugin = {
     });
   },
 };
-
-function parsePluginConfig(value: unknown): PluginConfig {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("memory-lancedb-pro config required");
-  }
-  const cfg = value as Record<string, unknown>;
-
-  const embedding = cfg.embedding as Record<string, unknown> | undefined;
-  if (!embedding) {
-    throw new Error("embedding config is required");
-  }
-
-  // Accept single key (string) or array of keys for round-robin rotation
-  let apiKey: string | string[];
-  if (typeof embedding.apiKey === "string") {
-    apiKey = embedding.apiKey;
-  } else if (Array.isArray(embedding.apiKey) && embedding.apiKey.length > 0) {
-    // Validate every element is a non-empty string
-    const invalid = embedding.apiKey.findIndex(
-      (k: unknown) => typeof k !== "string" || (k as string).trim().length === 0,
-    );
-    if (invalid !== -1) {
-      throw new Error(
-        `embedding.apiKey[${invalid}] is invalid: expected non-empty string`,
-      );
-    }
-    apiKey = embedding.apiKey as string[];
-  } else if (embedding.apiKey !== undefined) {
-    // apiKey is present but wrong type — throw, don't silently fall back
-    throw new Error("embedding.apiKey must be a string or non-empty array of strings");
-  } else {
-    apiKey = process.env.OPENAI_API_KEY || "";
-  }
-
-  if (!apiKey || (Array.isArray(apiKey) && apiKey.length === 0)) {
-    throw new Error("embedding.apiKey is required (set directly or via OPENAI_API_KEY env var)");
-  }
-
-  return {
-    embedding: {
-      provider: "openai-compatible",
-      apiKey,
-      model:
-        typeof embedding.model === "string"
-          ? embedding.model
-          : "text-embedding-3-small",
-      baseURL:
-        typeof embedding.baseURL === "string"
-          ? resolveEnvVars(embedding.baseURL)
-          : undefined,
-      // Accept number, numeric string, or env-var string (e.g. "${EMBED_DIM}").
-      // Also accept legacy top-level `dimensions` for convenience.
-      dimensions: parsePositiveInt(embedding.dimensions ?? cfg.dimensions),
-      taskQuery:
-        typeof embedding.taskQuery === "string"
-          ? embedding.taskQuery
-          : undefined,
-      taskPassage:
-        typeof embedding.taskPassage === "string"
-          ? embedding.taskPassage
-          : undefined,
-      normalized:
-        typeof embedding.normalized === "boolean"
-          ? embedding.normalized
-          : undefined,
-    },
-    dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
-    autoCapture: cfg.autoCapture !== false,
-    // Default OFF: only enable when explicitly set to true.
-    autoRecall: cfg.autoRecall === true,
-    autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
-    autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
-    captureAssistant: cfg.captureAssistant === true,
-    retrieval:
-      typeof cfg.retrieval === "object" && cfg.retrieval !== null
-        ? (cfg.retrieval as any)
-        : undefined,
-    scopes:
-      typeof cfg.scopes === "object" && cfg.scopes !== null
-        ? (cfg.scopes as any)
-        : undefined,
-    enableManagementTools: cfg.enableManagementTools === true,
-    sessionMemory:
-      typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
-        ? {
-            enabled:
-              (cfg.sessionMemory as Record<string, unknown>).enabled !== false,
-            messageCount:
-              typeof (cfg.sessionMemory as Record<string, unknown>)
-                .messageCount === "number"
-                ? ((cfg.sessionMemory as Record<string, unknown>)
-                    .messageCount as number)
-                : undefined,
-          }
-        : undefined,
-    mdMirror:
-      typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
-        ? {
-            enabled:
-              (cfg.mdMirror as Record<string, unknown>).enabled === true,
-            dir:
-              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
-                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
-                : undefined,
-          }
-        : undefined,
-    autoCaptureLLM:
-      typeof cfg.autoCaptureLLM === "object" && cfg.autoCaptureLLM !== null
-        ? {
-            enabled:
-              (cfg.autoCaptureLLM as Record<string, unknown>).enabled === true,
-            endpoint:
-              typeof (cfg.autoCaptureLLM as Record<string, unknown>).endpoint === "string"
-                ? ((cfg.autoCaptureLLM as Record<string, unknown>).endpoint as string)
-                : undefined,
-            model:
-              typeof (cfg.autoCaptureLLM as Record<string, unknown>).model === "string"
-                ? ((cfg.autoCaptureLLM as Record<string, unknown>).model as string)
-                : undefined,
-            timeoutMs: parsePositiveInt(
-              (cfg.autoCaptureLLM as Record<string, unknown>).timeoutMs,
-            ),
-          }
-        : undefined,
-  };
-
-  // ---- Cross-group validation warnings ----
-  const warnings: string[] = [];
-
-  if (
-    parsed.retrieval?.rerank === "cross-encoder" &&
-    !parsed.retrieval?.rerankApiKey
-  ) {
-    warnings.push(
-      "retrieval.rerank is 'cross-encoder' but rerankApiKey is missing — reranking will fall back to cosine similarity",
-    );
-  }
-  if (
-    parsed.retrieval?.rerankProvider &&
-    !parsed.retrieval?.rerankEndpoint &&
-    parsed.retrieval?.rerankProvider !== "jina"
-  ) {
-    warnings.push(
-      `retrieval.rerankProvider is '${parsed.retrieval.rerankProvider}' but rerankEndpoint is missing — provider may use wrong default URL`,
-    );
-  }
-  if (parsed.autoCaptureLLM?.enabled && !parsed.autoCapture) {
-    warnings.push(
-      "autoCaptureLLM.enabled is true but autoCapture is false — LLM fallback has no effect when autoCapture is disabled",
-    );
-  }
-
-  // Attach warnings for the caller to log (non-throwing)
-  (parsed as any)._configWarnings = warnings;
-
-  return parsed;
-}
 
 export default memoryLanceDBProPlugin;
