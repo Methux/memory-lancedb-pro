@@ -16,18 +16,6 @@ Hybrid Retrieval (Vector + BM25) · Cross-Encoder Rerank · Multi-Scope Isolatio
 
 ---
 
-## 📺 Video Tutorial
-
-> **Watch the full walkthrough — covers installation, configuration, and how hybrid retrieval works under the hood.**
-
-[![YouTube Video](https://img.shields.io/badge/YouTube-Watch%20Now-red?style=for-the-badge&logo=youtube)](https://youtu.be/MtukF1C8epQ)
-🔗 **https://youtu.be/MtukF1C8epQ**
-
-[![Bilibili Video](https://img.shields.io/badge/Bilibili-立即观看-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white)](https://www.bilibili.com/video/BV1zUf2BGEgn/)
-🔗 **https://www.bilibili.com/video/BV1zUf2BGEgn/**
-
----
-
 ## Why This Plugin?
 
 The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. **memory-lancedb-pro** takes it much further:
@@ -236,7 +224,7 @@ To avoid ambiguity, use an **absolute path** (Option B) or clone into `<workspac
 cd /path/to/your/openclaw/workspace
 
 # 2) Clone the plugin into workspace/plugins/
-git clone https://github.com/win4r/memory-lancedb-pro.git plugins/memory-lancedb-pro
+git clone https://github.com/Methux/memory-lancedb-pro.git plugins/memory-lancedb-pro
 
 # 3) Install dependencies
 cd plugins/memory-lancedb-pro
@@ -853,58 +841,6 @@ Config-only changes do NOT need cache clearing.
 
 ---
 
-## Contributors
-
-Top contributors (from GitHub's contributors list, sorted by commit contributions; bots excluded):
-
-<p>
-<a href="https://github.com/win4r"><img src="https://avatars.githubusercontent.com/u/42172631?v=4" width="48" height="48" alt="@win4r" /></a>
-<a href="https://github.com/kctony"><img src="https://avatars.githubusercontent.com/u/1731141?v=4" width="48" height="48" alt="@kctony" /></a>
-<a href="https://github.com/Akatsuki-Ryu"><img src="https://avatars.githubusercontent.com/u/8062209?v=4" width="48" height="48" alt="@Akatsuki-Ryu" /></a>
-<a href="https://github.com/AliceLJY"><img src="https://avatars.githubusercontent.com/u/136287420?v=4" width="48" height="48" alt="@AliceLJY" /></a>
-<a href="https://github.com/JasonSuz"><img src="https://avatars.githubusercontent.com/u/612256?v=4" width="48" height="48" alt="@JasonSuz" /></a>
-<a href="https://github.com/Minidoracat"><img src="https://avatars.githubusercontent.com/u/11269639?v=4" width="48" height="48" alt="@Minidoracat" /></a>
-<a href="https://github.com/rwmjhb"><img src="https://avatars.githubusercontent.com/u/91475811?v=4" width="48" height="48" alt="@rwmjhb" /></a>
-<a href="https://github.com/furedericca-lab"><img src="https://avatars.githubusercontent.com/u/263020793?v=4" width="48" height="48" alt="@furedericca-lab" /></a>
-<a href="https://github.com/joe2643"><img src="https://avatars.githubusercontent.com/u/19421931?v=4" width="48" height="48" alt="@joe2643" /></a>
-<a href="https://github.com/chenjiyong"><img src="https://avatars.githubusercontent.com/u/8199522?v=4" width="48" height="48" alt="@chenjiyong" /></a>
-</p>
-
-- [@win4r](https://github.com/win4r) (4 commits)
-- [@kctony](https://github.com/kctony) (2 commits)
-- [@Akatsuki-Ryu](https://github.com/Akatsuki-Ryu) (1 commit)
-- [@AliceLJY](https://github.com/AliceLJY) (1 commit)
-- [@JasonSuz](https://github.com/JasonSuz) (1 commit)
-- [@Minidoracat](https://github.com/Minidoracat) (1 commit)
-- [@rwmjhb](https://github.com/rwmjhb) (1 commit)
-- [@furedericca-lab](https://github.com/furedericca-lab) (1 commit)
-- [@joe2643](https://github.com/joe2643) (1 commit)
-- [@chenjiyong](https://github.com/chenjiyong) (1 commit)
-
-Full list: https://github.com/win4r/memory-lancedb-pro/graphs/contributors
-
-## ⭐ Star History
-
-<a href="https://star-history.com/#win4r/memory-lancedb-pro&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
-  </picture>
-</a>
-
 ## License
 
 MIT
-
----
-
-## Buy Me a Coffee
-
-[!["Buy Me A Coffee"](https://storage.ko-fi.com/cdn/kofi2.png?v=3)](https://ko-fi.com/aila)
-
-## My WeChat Group and My WeChat QR Code
-
-<img src="https://github.com/win4r/AISuperDomain/assets/42172631/d6dcfd1a-60fa-4b6f-9d5e-1482150a7d95" width="186" height="300">
-<img src="https://github.com/win4r/AISuperDomain/assets/42172631/7568cf78-c8ba-4182-aa96-d524d903f2bc" width="214.8" height="291">
-<img src="https://github.com/win4r/AISuperDomain/assets/42172631/fefe535c-8153-4046-bfb4-e65eacbf7a33" width="207" height="281">
