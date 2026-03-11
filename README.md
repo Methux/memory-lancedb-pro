@@ -658,6 +658,81 @@ openclaw memory-pro migrate verify [--source /path]
 
 ---
 
+## MCP Server for Claude Code
+
+`memory-lancedb-pro` ships a built-in **MCP (Model Context Protocol) server** that lets Claude Code (and any MCP-compatible client) call memory tools directly — no OpenClaw gateway needed.
+
+### What it does
+
+The MCP server exposes 6 tools over stdio JSON-RPC, backed by the **same LanceDB vector store** as the OpenClaw plugin:
+
+| Tool | Description |
+|------|-------------|
+| `memory_search` | Hybrid vector + BM25 retrieval with cross-encoder reranking |
+| `memory_store` | Store a memory with dedup check |
+| `memory_delete` | Delete a memory by ID |
+| `memory_update` | Update text / importance / category (re-embeds if text changed) |
+| `memory_list` | List memories with filters (scope, category, offset, limit) |
+| `memory_stats` | Storage statistics per scope / category |
+
+Config is read automatically from `~/.openclaw/openclaw.json` — no extra config file required.
+
+### Register with Claude Code
+
+```bash
+# Single-command registration (user scope — persists across projects)
+claude mcp add memory -s user -- node --import jiti/register \
+  /path/to/memory-lancedb-pro/src/mcp-server.ts
+```
+
+Verify:
+
+```bash
+claude mcp list
+```
+
+### Architecture
+
+```
+Claude Code  <──stdio/JSON-RPC──>  src/mcp-server.ts
+                                         │
+                                         ├── MemoryStore   (~/.openclaw/memory/lancedb-pro)
+                                         ├── Embedder      (same embedding provider as plugin)
+                                         ├── Retriever     (hybrid vector+BM25 → rerank)
+                                         └── ScopeManager  (access control)
+
+OpenClaw Gateway  <──>  src/index.ts  (same DB, concurrent access safe via LanceDB MVCC)
+```
+
+Both the MCP server and the OpenClaw gateway can run simultaneously — LanceDB MVCC handles concurrent writes safely.
+
+### Local embedding support (Ollama)
+
+If you use a local embedding model (e.g. `bge-m3` via Ollama), configure it in your `openclaw.json`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "config": {
+          "embedding": {
+            "provider": "openai-compatible",
+            "baseURL": "http://localhost:11434/v1",
+            "model": "bge-m3",
+            "dimensions": 1024
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The MCP server will use the same Ollama endpoint. For high availability, you can run an **embedding proxy** (included in the repo) that auto-falls-back to a cloud provider if Ollama is unavailable.
+
+---
+
 ## Custom Commands (e.g. `/lesson`)
 
 This plugin provides the core memory tools (`memory_store`, `memory_recall`, `memory_forget`, `memory_update`). You can define custom slash commands in your Agent's system prompt to create convenient shortcuts.
