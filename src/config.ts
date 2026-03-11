@@ -54,7 +54,7 @@ export interface PluginConfig {
     agentAccess?: Record<string, string[]>;
   };
   enableManagementTools?: boolean;
-  sessionMemory?: { enabled?: boolean; messageCount?: number; liveSearch?: boolean; liveSearchMessageCount?: number };
+  sessionMemory?: { enabled?: boolean; messageCount?: number };
   mdMirror?: { enabled?: boolean; dir?: string };
   autoCaptureLLM?: {
     enabled?: boolean;
@@ -186,14 +186,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
                 .messageCount === "number"
                 ? ((cfg.sessionMemory as Record<string, unknown>)
                     .messageCount as number)
-                : undefined,
-            liveSearch:
-              (cfg.sessionMemory as Record<string, unknown>).liveSearch !== false,
-            liveSearchMessageCount:
-              typeof (cfg.sessionMemory as Record<string, unknown>)
-                .liveSearchMessageCount === "number"
-                ? ((cfg.sessionMemory as Record<string, unknown>)
-                    .liveSearchMessageCount as number)
                 : undefined,
           }
         : undefined,
