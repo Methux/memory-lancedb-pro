@@ -5,9 +5,11 @@
 import type { Command } from "commander";
 import { readFileSync } from "node:fs";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
-import type { MemoryRetriever } from "./src/retriever.js";
+import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
+import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import type { LlmClient } from "./src/llm-client.js";
 
 // ============================================================================
 // Types
@@ -19,6 +21,7 @@ interface CLIContext {
   scopeManager: MemoryScopeManager;
   migrator: MemoryMigrator;
   embedder?: import("./src/embedder.js").Embedder;
+  llmClient?: LlmClient;
 }
 
 // ============================================================================
@@ -53,11 +56,50 @@ function formatJson(obj: any): string {
   return JSON.stringify(obj, null, 2);
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // ============================================================================
 // CLI Command Implementations
 // ============================================================================
 
 export function registerMemoryCLI(program: Command, context: CLIContext): void {
+  const getSearchRetriever = (): MemoryRetriever => {
+    if (!context.embedder) {
+      return context.retriever;
+    }
+    return createRetriever(context.store, context.embedder, context.retriever.getConfig());
+  };
+
+  const runSearch = async (
+    query: string,
+    limit: number,
+    scopeFilter?: string[],
+    category?: string,
+  ) => {
+    let results = await getSearchRetriever().retrieve({
+      query,
+      limit,
+      scopeFilter,
+      category,
+      source: "cli",
+    });
+
+    if (results.length === 0 && context.embedder) {
+      await sleep(75);
+      results = await getSearchRetriever().retrieve({
+        query,
+        limit,
+        scopeFilter,
+        category,
+        source: "cli",
+      });
+    }
+
+    return results;
+  };
+
   const memory = program
     .command("memory-pro")
     .description("Enhanced memory management commands (LanceDB Pro)");
@@ -131,12 +173,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter = [options.scope];
         }
 
-        const results = await context.retriever.retrieve({
-          query,
-          limit,
-          scopeFilter,
-          category: options.category,
-        });
+        const results = await runSearch(query, limit, scopeFilter, options.category);
 
         if (options.json) {
           console.log(formatJson(results));
@@ -382,10 +419,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             const categoryRaw = memory.category;
             const category: MemoryEntry["category"] =
               categoryRaw === "preference" ||
-              categoryRaw === "fact" ||
-              categoryRaw === "decision" ||
-              categoryRaw === "entity" ||
-              categoryRaw === "other"
+                categoryRaw === "fact" ||
+                categoryRaw === "decision" ||
+                categoryRaw === "entity" ||
+                categoryRaw === "other"
                 ? categoryRaw
                 : "other";
 
@@ -496,10 +533,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         let targetReal = context.store.dbPath;
         try {
           sourceReal = await fs.realpath(sourceDbPath);
-        } catch {}
+        } catch { }
         try {
           targetReal = await fs.realpath(context.store.dbPath);
-        } catch {}
+        } catch { }
 
         if (!force && sourceReal === targetReal) {
           console.error("Refusing to re-embed in-place: source-db equals target dbPath. Use a new dbPath or pass --force.");
@@ -590,6 +627,73 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       }
     });
 
+  // Upgrade legacy memories to new smart memory format
+  memory
+    .command("upgrade")
+    .description("Upgrade legacy memories to new 6-category L0/L1/L2 smart memory format")
+    .option("--dry-run", "Show upgrade statistics without modifying data")
+    .option("--batch-size <n>", "Number of memories per batch", "10")
+    .option("--no-llm", "Skip LLM calls; use simple text truncation for L0/L1")
+    .option("--limit <n>", "Maximum number of memories to upgrade")
+    .option("--scope <scope>", "Only upgrade memories in this scope")
+    .action(async (options) => {
+      try {
+        const upgrader = createMemoryUpgrader(
+          context.store,
+          options.llm === false ? null : (context.llmClient ?? null),
+          { log: console.log },
+        );
+
+        // Show current status first
+        const scopeFilter = options.scope ? [options.scope] : undefined;
+        const counts = await upgrader.countLegacy(scopeFilter);
+
+        console.log(`Memory Upgrade Status:`);
+        console.log(`• Total memories: ${counts.total}`);
+        console.log(`• Legacy (needs upgrade): ${counts.legacy}`);
+        console.log(`• Already new format: ${counts.total - counts.legacy}`);
+        if (Object.keys(counts.byCategory).length > 0) {
+          console.log(`• Legacy by category:`);
+          Object.entries(counts.byCategory).forEach(([cat, n]) => {
+            console.log(`    ${cat}: ${n}`);
+          });
+        }
+
+        if (counts.legacy === 0) {
+          console.log(`\nAll memories are already in the new format. No upgrade needed.`);
+          return;
+        }
+
+        if (options.dryRun) {
+          console.log(`\n[DRY-RUN] Would upgrade ${counts.legacy} memories.`);
+          return;
+        }
+
+        console.log(`\nStarting upgrade...`);
+        const result = await upgrader.upgrade({
+          dryRun: false,
+          batchSize: parseInt(options.batchSize) || 10,
+          noLlm: options.llm === false,
+          limit: options.limit ? parseInt(options.limit) : undefined,
+          scopeFilter,
+        });
+
+        console.log(`\nUpgrade Results:`);
+        console.log(`• Upgraded: ${result.upgraded}`);
+        console.log(`• Already new format: ${result.skipped}`);
+        if (result.errors.length > 0) {
+          console.log(`• Errors: ${result.errors.length}`);
+          result.errors.slice(0, 5).forEach(err => console.log(`  - ${err}`));
+          if (result.errors.length > 5) {
+            console.log(`  ... and ${result.errors.length - 5} more`);
+          }
+        }
+      } catch (error) {
+        console.error("Upgrade failed:", error);
+        process.exit(1);
+      }
+    });
+
   // Migration commands
   const migrate = memory
     .command("migrate")
@@ -676,6 +780,27 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
       } catch (error) {
         console.error("Verification failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // reindex-fts: Rebuild FTS index
+  program
+    .command("reindex-fts")
+    .description("Rebuild the BM25 full-text search index")
+    .action(async () => {
+      try {
+        const status = context.store.getFtsStatus();
+        console.log(`FTS status before: available=${status.available}, lastError=${status.lastError || "none"}`);
+        const result = await context.store.rebuildFtsIndex();
+        if (result.success) {
+          console.log("✅ FTS index rebuilt successfully");
+        } else {
+          console.error("❌ FTS rebuild failed:", result.error);
+          process.exit(1);
+        }
+      } catch (error) {
+        console.error("FTS rebuild error:", error);
         process.exit(1);
       }
     });

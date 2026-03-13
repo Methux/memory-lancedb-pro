@@ -1,18 +1,27 @@
 # Changelog
 
-## 1.0.32
+## 1.1.0-beta.2 (Smart Memory Beta + Access Reinforcement)
 
-- Fix: strip OpenClaw `Conversation info` / `Sender` metadata noise before auto-capture matching and adaptive retrieval normalization, reducing false captures and noisy retrieval triggers.
-- Fix: parse `autoRecallMinRepeated` from plugin config so repeated-memory suppression works when configured.
+This is a **beta** release published under the npm dist-tag **`beta`** (it does not affect the stable `latest` channel).
 
-PR: #50
+Highlights:
+- **Smart Extraction (LLM-powered)**: 6-category extraction with L0/L1/L2 metadata (falls back to regex capture when disabled or init fails)
+- **Lifecycle scoring integrated into retrieval**: decay-based score adjustment + tier floors
+- **Tier transitions (best-effort)**: bounded metadata write-backs for top results (tier / access stats)
+- **Access reinforcement for time decay**: frequently *manually recalled* memories decay more slowly (spaced-repetition style)
+  - Adds `AccessTracker` with debounced metadata write-back (accessCount / lastAccessedAt)
+  - Adds retrieval config: `reinforcementFactor` (default: 0.5) and `maxHalfLifeMultiplier` (default: 3)
+
+Notes:
+- Access reinforcement is gated to manual recall (`source: \"manual\"`) to avoid auto-recall strengthening noise.
 
 ---
 
+## 1.1.0-beta.1 (Smart Memory Beta)
 
-## 1.0.31
+- Initial beta with Smart Extraction + lifecycle components (decay engine + tier manager)
 
-- Fix: `memory-pro import` now preserves provided IDs and is idempotent (skips if ID already exists).
+---
 
 ## 1.0.26
 

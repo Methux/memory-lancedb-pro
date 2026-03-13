@@ -4,13 +4,22 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { stringEnum } from "openclaw/plugin-sdk";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
 import type { MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
+import {
+  buildSmartMetadata,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+} from "./smart-metadata.js";
+import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
+import { getDisplayCategoryTag } from "./reflection-metadata.js";
 
 // ============================================================================
 // Types
@@ -21,9 +30,16 @@ export const MEMORY_CATEGORIES = [
   "fact",
   "decision",
   "entity",
+  "reflection",
   "other",
 ] as const;
 
+function stringEnum<T extends readonly [string, ...string[]]>(values: T) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: [...values],
+  });
+}
 export type MdMirrorWriter = (
   entry: { text: string; category: string; scope: string; timestamp?: number },
   meta?: { source?: string; agentId?: string },
@@ -35,6 +51,7 @@ interface ToolContext {
   scopeManager: MemoryScopeManager;
   embedder: Embedder;
   agentId?: string;
+  workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
 }
 
@@ -62,12 +79,308 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
   return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
-    category: r.entry.category,
+    category: getDisplayCategoryTag(r.entry),
+    rawCategory: r.entry.category,
     scope: r.entry.scope,
     importance: r.entry.importance,
     score: r.score,
     sources: r.sources,
   }));
+}
+
+function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const m = /^agent:([^:]+):/.exec(sessionKey);
+  return m?.[1];
+}
+
+function resolveRuntimeAgentId(
+  staticAgentId: string | undefined,
+  runtimeCtx: unknown,
+): string | undefined {
+  if (!runtimeCtx || typeof runtimeCtx !== "object") return staticAgentId;
+  const ctx = runtimeCtx as Record<string, unknown>;
+  const ctxAgentId = typeof ctx.agentId === "string" ? ctx.agentId : undefined;
+  const ctxSessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : undefined;
+  return ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
+}
+
+function resolveToolContext(
+  base: ToolContext,
+  runtimeCtx: unknown,
+): ToolContext {
+  return {
+    ...base,
+    agentId: resolveRuntimeAgentId(base.agentId, runtimeCtx),
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function retrieveWithRetry(
+  retriever: MemoryRetriever,
+  params: {
+    query: string;
+    limit: number;
+    scopeFilter?: string[];
+    category?: string;
+  },
+): Promise<RetrievalResult[]> {
+  let results = await retriever.retrieve(params);
+  if (results.length === 0) {
+    await sleep(75);
+    results = await retriever.retrieve(params);
+  }
+  return results;
+}
+
+function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
+  const runtime = toolCtx as Record<string, unknown> | undefined;
+  const runtimePath = typeof runtime?.workspaceDir === "string" ? runtime.workspaceDir.trim() : "";
+  if (runtimePath) return runtimePath;
+  if (fallback && fallback.trim()) return fallback;
+  return join(homedir(), ".openclaw", "workspace");
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_log",
+      label: "Self-Improvement Log",
+      description: "Log structured learning/error entries into .learnings for governance and later distillation.",
+      parameters: Type.Object({
+        type: stringEnum(["learning", "error"]),
+        summary: Type.String({ description: "One-line summary" }),
+        details: Type.Optional(Type.String({ description: "Detailed context or error output" })),
+        suggestedAction: Type.Optional(Type.String({ description: "Concrete action to prevent recurrence" })),
+        category: Type.Optional(Type.String({ description: "learning category (correction/best_practice/knowledge_gap) when type=learning" })),
+        area: Type.Optional(Type.String({ description: "frontend|backend|infra|tests|docs|config or custom area" })),
+        priority: Type.Optional(Type.String({ description: "low|medium|high|critical" })),
+      }),
+      async execute(_toolCallId, params) {
+        const {
+          type,
+          summary,
+          details = "",
+          suggestedAction = "",
+          category = "best_practice",
+          area = "config",
+          priority = "medium",
+        } = params as {
+          type: "learning" | "error";
+          summary: string;
+          details?: string;
+          suggestedAction?: string;
+          category?: string;
+          area?: string;
+          priority?: string;
+        };
+        try {
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          const { id: entryId, filePath } = await appendSelfImprovementEntry({
+            baseDir: workspaceDir,
+            type,
+            summary,
+            details,
+            suggestedAction,
+            category,
+            area,
+            priority,
+            source: "memory-lancedb-pro/self_improvement_log",
+          });
+          const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
+
+          return {
+            content: [{ type: "text", text: `Logged ${type} entry ${entryId} to .learnings/${fileName}` }],
+            details: { action: "logged", type, id: entryId, filePath },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to log self-improvement entry: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_log_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_log" }
+  );
+}
+
+export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_extract_skill",
+      label: "Extract Skill From Learning",
+      description: "Create a new skill scaffold from a learning entry and mark the source learning as promoted_to_skill.",
+      parameters: Type.Object({
+        learningId: Type.String({ description: "Learning ID like LRN-YYYYMMDD-001" }),
+        skillName: Type.String({ description: "Skill folder name, lowercase with hyphens" }),
+        sourceFile: Type.Optional(stringEnum(["LEARNINGS.md", "ERRORS.md"])),
+        outputDir: Type.Optional(Type.String({ description: "Relative output dir under workspace (default: skills)" })),
+      }),
+      async execute(_toolCallId, params) {
+        const { learningId, skillName, sourceFile = "LEARNINGS.md", outputDir = "skills" } = params as {
+          learningId: string;
+          skillName: string;
+          sourceFile?: "LEARNINGS.md" | "ERRORS.md";
+          outputDir?: string;
+        };
+        try {
+          if (!/^(LRN|ERR)-\d{8}-\d{3}$/.test(learningId)) {
+            return {
+              content: [{ type: "text", text: "Invalid learningId format. Use LRN-YYYYMMDD-001 / ERR-..." }],
+              details: { error: "invalid_learning_id" },
+            };
+          }
+          if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(skillName)) {
+            return {
+              content: [{ type: "text", text: "Invalid skillName. Use lowercase letters, numbers, and hyphens only." }],
+              details: { error: "invalid_skill_name" },
+            };
+          }
+
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          await ensureSelfImprovementLearningFiles(workspaceDir);
+          const learningsPath = join(workspaceDir, ".learnings", sourceFile);
+          const learningBody = await readFile(learningsPath, "utf-8");
+          const escapedLearningId = escapeRegExp(learningId.trim());
+          const entryRegex = new RegExp(`## \\[${escapedLearningId}\\][\\s\\S]*?(?=\\n## \\[|$)`, "m");
+          const match = learningBody.match(entryRegex);
+          if (!match) {
+            return {
+              content: [{ type: "text", text: `Learning entry ${learningId} not found in .learnings/${sourceFile}` }],
+              details: { error: "learning_not_found", learningId, sourceFile },
+            };
+          }
+
+          const summaryMatch = match[0].match(/### Summary\n([\s\S]*?)\n###/m);
+          const summary = (summaryMatch?.[1] ?? "Summarize the source learning here.").trim();
+          const safeOutputDir = outputDir
+            .replace(/\\/g, "/")
+            .split("/")
+            .filter((segment) => segment && segment !== "." && segment !== "..")
+            .join("/");
+          const skillDir = join(workspaceDir, safeOutputDir || "skills", skillName);
+          await mkdir(skillDir, { recursive: true });
+          const skillPath = join(skillDir, "SKILL.md");
+          const skillTitle = skillName
+            .split("-")
+            .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+            .join(" ");
+          const skillContent = [
+            "---",
+            `name: ${skillName}`,
+            `description: "Extracted from learning ${learningId}. Replace with a concise description."`,
+            "---",
+            "",
+            `# ${skillTitle}`,
+            "",
+            "## Why",
+            summary,
+            "",
+            "## When To Use",
+            "- [TODO] Define trigger conditions",
+            "",
+            "## Steps",
+            "1. [TODO] Add repeatable workflow steps",
+            "2. [TODO] Add verification steps",
+            "",
+            "## Source Learning",
+            `- Learning ID: ${learningId}`,
+            `- Source File: .learnings/${sourceFile}`,
+            "",
+          ].join("\n");
+          await writeFile(skillPath, skillContent, "utf-8");
+
+          const promotedMarker = `**Status**: promoted_to_skill`;
+          const skillPathMarker = `- Skill-Path: ${safeOutputDir || "skills"}/${skillName}`;
+          let updatedEntry = match[0];
+          updatedEntry = updatedEntry.includes("**Status**:")
+            ? updatedEntry.replace(/\*\*Status\*\*:\s*.+/m, promotedMarker)
+            : `${updatedEntry.trimEnd()}\n${promotedMarker}\n`;
+          if (!updatedEntry.includes("Skill-Path:")) {
+            updatedEntry = `${updatedEntry.trimEnd()}\n${skillPathMarker}\n`;
+          }
+          const updatedLearningBody = learningBody.replace(match[0], updatedEntry);
+          await writeFile(learningsPath, updatedLearningBody, "utf-8");
+
+          return {
+            content: [{ type: "text", text: `Extracted skill scaffold to ${safeOutputDir || "skills"}/${skillName}/SKILL.md and updated ${learningId}.` }],
+            details: {
+              action: "skill_extracted",
+              learningId,
+              sourceFile,
+              skillPath: `${safeOutputDir || "skills"}/${skillName}/SKILL.md`,
+            },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to extract skill: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_extract_skill_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_extract_skill" }
+  );
+}
+
+export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_review",
+      label: "Self-Improvement Review",
+      description: "Summarize governance backlog from .learnings files (pending/high-priority/promoted counts).",
+      parameters: Type.Object({}),
+      async execute() {
+        try {
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          await ensureSelfImprovementLearningFiles(workspaceDir);
+          const learningsDir = join(workspaceDir, ".learnings");
+          const files = ["LEARNINGS.md", "ERRORS.md"] as const;
+          const stats = { pending: 0, high: 0, promoted: 0, total: 0 };
+
+          for (const f of files) {
+            const content = await readFile(join(learningsDir, f), "utf-8").catch(() => "");
+            stats.total += (content.match(/^## \[/gm) || []).length;
+            stats.pending += (content.match(/\*\*Status\*\*:\s*pending/gi) || []).length;
+            stats.high += (content.match(/\*\*Priority\*\*:\s*(high|critical)/gi) || []).length;
+            stats.promoted += (content.match(/\*\*Status\*\*:\s*promoted(_to_skill)?/gi) || []).length;
+          }
+
+          const text = [
+            "Self-Improvement Governance Snapshot:",
+            `- Total entries: ${stats.total}`,
+            `- Pending: ${stats.pending}`,
+            `- High/Critical: ${stats.high}`,
+            `- Promoted: ${stats.promoted}`,
+            "",
+            "Recommended loop:",
+            "1) Resolve high-priority pending entries",
+            "2) Distill reusable rules into AGENTS.md / SOUL.md / TOOLS.md",
+            "3) Extract repeatable patterns as skills",
+          ].join("\n");
+
+          return {
+            content: [{ type: "text", text }],
+            details: { action: "review", stats },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to review self-improvement backlog: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_review_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_review" }
+  );
 }
 
 // ============================================================================
@@ -80,9 +393,9 @@ export function registerMemoryRecallTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
-        name: "memory_recall",
+      name: "memory_recall",
       label: "Memory Recall",
       description:
         "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
@@ -117,11 +430,12 @@ export function registerMemoryRecallTool(
 
         try {
           const safeLimit = clampInt(limit, 1, 20);
+          const agentId = runtimeContext.agentId;
 
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
+            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -136,7 +450,7 @@ export function registerMemoryRecallTool(
             }
           }
 
-          const results = await context.retriever.retrieve({
+          const results = await retrieveWithRetry(runtimeContext.retriever, {
             query,
             limit: safeLimit,
             scopeFilter,
@@ -151,14 +465,25 @@ export function registerMemoryRecallTool(
             };
           }
 
+          const now = Date.now();
+          await Promise.allSettled(
+            results.map((result) => {
+              const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+              return runtimeContext.store.patchMetadata(
+                result.entry.id,
+                {
+                  access_count: meta.access_count + 1,
+                  last_accessed_at: now,
+                },
+                scopeFilter,
+              );
+            }),
+          );
+
           const text = results
             .map((r, i) => {
-              const sources = [];
-              if (r.sources.vector) sources.push("vector");
-              if (r.sources.bm25) sources.push("BM25");
-              if (r.sources.reranked) sources.push("reranked");
-
-              return `${i + 1}. [${r.entry.id}] [${r.entry.category}:${r.entry.scope}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+              const categoryTag = getDisplayCategoryTag(r.entry);
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
             })
             .join("\n");
 
@@ -174,7 +499,7 @@ export function registerMemoryRecallTool(
               memories: sanitizeMemoryForSerialization(results),
               query,
               scopes: scopeFilter,
-              retrievalMode: context.retriever.getConfig().mode,
+              retrievalMode: runtimeContext.retriever.getConfig().mode,
             },
           };
         } catch (error) {
@@ -201,9 +526,9 @@ export function registerMemoryStoreTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
-        name: "memory_store",
+      name: "memory_store",
       label: "Memory Store",
       description:
         "Save important information in long-term memory. Use for preferences, facts, decisions, and other notable information.",
@@ -233,11 +558,12 @@ export function registerMemoryStoreTool(
         };
 
         try {
+          const agentId = runtimeContext.agentId;
           // Determine target scope
-          let targetScope = scope || context.scopeManager.getDefaultScope(agentId);
+          let targetScope = scope || runtimeContext.scopeManager.getDefaultScope(agentId);
 
           // Validate scope access
-          if (!context.scopeManager.isAccessible(targetScope, agentId)) {
+          if (!runtimeContext.scopeManager.isAccessible(targetScope, agentId)) {
             return {
               content: [
                 {
@@ -266,13 +592,13 @@ export function registerMemoryStoreTool(
           }
 
           const safeImportance = clamp01(importance, 0.7);
-          const vector = await context.embedder.embedPassage(text);
+          const vector = await runtimeContext.embedder.embedPassage(text);
 
           // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
           // Fail-open by design: dedup must never block a legitimate memory write.
-          let existing: Awaited<ReturnType<typeof context.store.vectorSearch>> = [];
+          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
           try {
-            existing = await context.store.vectorSearch(vector, 1, 0.1, [
+            existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
               targetScope,
             ]);
           } catch (err) {
@@ -299,26 +625,34 @@ export function registerMemoryStoreTool(
             };
           }
 
-          const entry = await context.store.store({
+          const entry = await runtimeContext.store.store({
             text,
             vector,
             importance: safeImportance,
             category: category as any,
             scope: targetScope,
+            metadata: stringifySmartMetadata(
+              buildSmartMetadata(
+                {
+                  text,
+                  category: category as any,
+                  importance: safeImportance,
+                },
+                {
+                  l0_abstract: text,
+                  l1_overview: `- ${text}`,
+                  l2_content: text,
+                },
+              ),
+            ),
           });
 
           // Dual-write to Markdown mirror if enabled
           if (context.mdMirror) {
-            try {
-              await context.mdMirror(
-                { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
-                { source: "memory_store", agentId },
-              );
-            } catch (mirrorErr) {
-              console.warn(
-                `memory-lancedb-pro: md-mirror write failed (memory_store), continuing: ${String(mirrorErr)}`,
-              );
-            }
+            await context.mdMirror(
+              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
+              { source: "memory_store", agentId },
+            );
           }
 
           return {
@@ -379,7 +713,7 @@ export function registerMemoryForgetTool(
           }),
         ),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const { query, memoryId, scope } = params as {
           query?: string;
           memoryId?: string;
@@ -387,6 +721,7 @@ export function registerMemoryForgetTool(
         };
 
         try {
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
@@ -428,7 +763,7 @@ export function registerMemoryForgetTool(
           }
 
           if (query) {
-            const results = await context.retriever.retrieve({
+            const results = await retrieveWithRetry(context.retriever, {
               query,
               limit: 5,
               scopeFilter,
@@ -540,7 +875,7 @@ export function registerMemoryUpdateTool(
         ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const { memoryId, text, importance, category } = params as {
           memoryId: string;
           text?: string;
@@ -562,6 +897,7 @@ export function registerMemoryUpdateTool(
           }
 
           // Determine accessible scopes
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           const scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
@@ -569,7 +905,7 @@ export function registerMemoryUpdateTool(
           const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
           if (!uuidLike) {
             // Treat as search query
-            const results = await context.retriever.retrieve({
+            const results = await retrieveWithRetry(context.retriever, {
               query: memoryId,
               limit: 3,
               scopeFilter,
@@ -707,10 +1043,11 @@ export function registerMemoryStatsTool(
           }),
         ),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const { scope } = params as { scope?: string };
 
         try {
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
@@ -809,7 +1146,7 @@ export function registerMemoryListTool(
           }),
         ),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const {
           limit = 10,
           scope,
@@ -825,6 +1162,7 @@ export function registerMemoryListTool(
         try {
           const safeLimit = clampInt(limit, 1, 50);
           const safeOffset = clampInt(offset, 0, 1000);
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
 
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
@@ -871,7 +1209,8 @@ export function registerMemoryListTool(
               const date = new Date(entry.timestamp)
                 .toISOString()
                 .split("T")[0];
-              return `${safeOffset + i + 1}. [${entry.id}] [${entry.category}:${entry.scope}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
+              const categoryTag = getDisplayCategoryTag(entry);
+              return `${safeOffset + i + 1}. [${entry.id}] [${categoryTag}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
             })
             .join("\n");
 
@@ -887,7 +1226,8 @@ export function registerMemoryListTool(
               memories: entries.map((e) => ({
                 id: e.id,
                 text: e.text,
-                category: e.category,
+                category: getDisplayCategoryTag(e),
+                rawCategory: e.category,
                 scope: e.scope,
                 importance: e.importance,
                 timestamp: e.timestamp,
@@ -927,6 +1267,7 @@ export function registerAllMemoryTools(
   context: ToolContext,
   options: {
     enableManagementTools?: boolean;
+    enableSelfImprovementTools?: boolean;
   } = {},
 ) {
   // Core tools (always enabled)
@@ -939,5 +1280,12 @@ export function registerAllMemoryTools(
   if (options.enableManagementTools) {
     registerMemoryStatsTool(api, context);
     registerMemoryListTool(api, context);
+  }
+  if (options.enableSelfImprovementTools !== false) {
+    registerSelfImprovementLogTool(api, context);
+    if (options.enableManagementTools) {
+      registerSelfImprovementExtractSkillTool(api, context);
+      registerSelfImprovementReviewTool(api, context);
+    }
   }
 }
