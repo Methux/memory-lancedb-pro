@@ -338,6 +338,27 @@ export class MemoryStore {
         `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
       );
     }
+
+    // ── Graphiti 时序图谱双写（fire-and-forget）──
+    // 写入成功后异步推送到 Graphiti，失败不影响主流程
+    if (process.env.GRAPHITI_ENABLED === "true") {
+      const graphitiBase = process.env.GRAPHITI_BASE_URL || "http://127.0.0.1:18799";
+      const scope = fullEntry.scope || "default";
+      const groupId = scope.startsWith("agent:") ? scope.split(":")[1] || "default" : "default";
+      fetch(`${graphitiBase}/episodes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: `[${fullEntry.category || "fact"}] ${fullEntry.text}`,
+          group_id: groupId,
+          reference_time: new Date(fullEntry.timestamp).toISOString(),
+          source: `lancedb-pro-store-${groupId}`,
+          category: fullEntry.category || "fact",
+        }),
+        signal: AbortSignal.timeout(15000),
+      }).catch(() => {}); // 吞掉所有异常
+    }
+
     return fullEntry;
   }
 

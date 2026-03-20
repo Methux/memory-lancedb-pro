@@ -449,19 +449,34 @@ export class Embedder {
     const payload: any = {
       model: this.model,
       input,
-      // Force float output to avoid SDK default base64 decoding path.
-      encoding_format: "float",
     };
 
-    if (task) payload.task = task;
+    // Force float output to avoid SDK default base64 decoding path.
+    // Skip for providers that reject this field (e.g. Voyage).
+    const isVoyage = this._baseURL?.includes("voyageai.com");
+    if (!isVoyage) {
+      payload.encoding_format = "float";
+    }
+
+    // Voyage uses "input_type" instead of "task"
+    if (task && isVoyage) {
+      // Map taskQuery/taskPassage to Voyage input_type
+      if (task.includes("query")) payload.input_type = "query";
+      else if (task.includes("passage") || task.includes("document")) payload.input_type = "document";
+      else payload.input_type = task;
+    } else if (task) {
+      payload.task = task;
+    }
     if (this._normalized !== undefined) payload.normalized = this._normalized;
 
     // Some OpenAI-compatible providers support requesting a specific vector size.
     // We only pass it through when explicitly configured to avoid breaking providers
     // that reject unknown fields.
-    if (this._requestDimensions && this._requestDimensions > 0) {
+    if (this._requestDimensions && this._requestDimensions > 0 && !isVoyage) {
       payload.dimensions = this._requestDimensions;
     }
+
+
 
     return payload;
   }
@@ -694,6 +709,7 @@ export class Embedder {
         dimensions: testEmbedding.length,
       };
     } catch (error) {
+
       return {
         success: false,
         error: error instanceof Error ? error.message : String(error),

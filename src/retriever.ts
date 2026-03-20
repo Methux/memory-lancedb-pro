@@ -306,29 +306,70 @@ export class MemoryRetriever {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
 
-    let results: RetrievalResult[];
-    if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-      results = await this.vectorOnlyRetrieval(
-        query,
-        safeLimit,
-        scopeFilter,
-        category,
-      );
-    } else {
-      results = await this.hybridRetrieval(
-        query,
-        safeLimit,
-        scopeFilter,
-        category,
-      );
-    }
+    // ── 并发查询：LanceDB + Graphiti ──
+    const lanceDbPromise = (async () => {
+      if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+        return this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category);
+      } else {
+        return this.hybridRetrieval(query, safeLimit, scopeFilter, category);
+      }
+    })();
+
+    const graphitiPromise = (async (): Promise<RetrievalResult[]> => {
+      if (process.env.GRAPHITI_ENABLED !== "true") return [];
+      try {
+        const graphitiBase = process.env.GRAPHITI_BASE_URL || "http://127.0.0.1:18799";
+        const scope = scopeFilter?.[0] || "default";
+        const groupId = scope.startsWith("agent:") ? scope.split(":")[1] || "default" : "default";
+        const resp = await fetch(`${graphitiBase}/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, group_id: groupId, limit: Math.min(safeLimit, 5) }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return [];
+        const facts = (await resp.json()) as Array<{
+          fact: string; valid_at?: string; expired_at?: string; created_at?: string;
+        }>;
+        // Convert Graphiti facts to RetrievalResult format (synthetic entries)
+        return facts
+          .filter(f => f.fact && !f.expired_at) // only active facts
+          .map((f, i) => ({
+            entry: {
+              id: `graphiti-${Date.now()}-${i}`,
+              text: f.fact,
+              vector: [],
+              category: "fact" as const,
+              scope: scope,
+              importance: 0.7,
+              timestamp: f.valid_at ? new Date(f.valid_at).getTime() : Date.now(),
+              metadata: JSON.stringify({ source: "graphiti", valid_at: f.valid_at }),
+            },
+            score: 0.65 + (0.01 * (facts.length - i)), // slight ordering bias
+            sources: { graphiti: { rank: i + 1 } },
+          } as RetrievalResult));
+      } catch {
+        return []; // Graphiti unavailable → silent fallback
+      }
+    })();
+
+    const [lanceResults, graphitiResults] = await Promise.all([lanceDbPromise, graphitiPromise]);
+
+    // Merge: LanceDB results first, append non-duplicate Graphiti facts
+    const lanceTexts = new Set(lanceResults.map(r => r.entry.text.slice(0, 80)));
+    const uniqueGraphiti = graphitiResults.filter(
+      r => !lanceTexts.has(r.entry.text.slice(0, 80))
+    );
+    const merged = [...lanceResults, ...uniqueGraphiti].slice(0, safeLimit);
 
     // Record access for reinforcement (manual recall only)
-    if (this.accessTracker && source === "manual" && results.length > 0) {
-      this.accessTracker.recordAccess(results.map((r) => r.entry.id));
+    if (this.accessTracker && source === "manual" && merged.length > 0) {
+      this.accessTracker.recordAccess(
+        merged.filter(r => !r.entry.id.startsWith("graphiti-")).map(r => r.entry.id)
+      );
     }
 
-    return results;
+    return merged;
   }
 
   private async vectorOnlyRetrieval(
