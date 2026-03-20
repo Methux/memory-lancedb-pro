@@ -341,7 +341,10 @@ export class MemoryStore {
 
     // ── Graphiti 时序图谱双写（fire-and-forget）──
     // 写入成功后异步推送到 Graphiti，失败不影响主流程
-    if (process.env.GRAPHITI_ENABLED === "true") {
+    // 过滤低质量条目：importance < 0.5 或 text < 20字 不写 Graphiti
+    const textLen = (fullEntry.text || "").length;
+    const importance = typeof fullEntry.importance === "number" ? fullEntry.importance : 0.7;
+    if (process.env.GRAPHITI_ENABLED === "true" && importance >= 0.5 && textLen >= 20) {
       const graphitiBase = process.env.GRAPHITI_BASE_URL || "http://127.0.0.1:18799";
       const scope = fullEntry.scope || "default";
       const groupId = scope.startsWith("agent:") ? scope.split(":")[1] || "default" : "default";

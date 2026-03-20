@@ -360,7 +360,18 @@ export class MemoryRetriever {
     const uniqueGraphiti = graphitiResults.filter(
       r => !lanceTexts.has(r.entry.text.slice(0, 80))
     );
-    const merged = [...lanceResults, ...uniqueGraphiti].slice(0, safeLimit);
+
+    // ── 跨源统一 Rerank ──
+    // 如果有 Graphiti 结果且 rerank 可用，将两路合并后统一精排
+    let merged: RetrievalResult[];
+    if (uniqueGraphiti.length > 0 && this.config.rerank !== "none" && this.config.rerankApiKey) {
+      const combined = [...lanceResults, ...uniqueGraphiti];
+      const queryVector = await this.embedder.embedQuery(query);
+      merged = await this.rerankResults(query, queryVector, combined);
+      merged = merged.slice(0, safeLimit);
+    } else {
+      merged = [...lanceResults, ...uniqueGraphiti].slice(0, safeLimit);
+    }
 
     // Record access for reinforcement (manual recall only)
     if (this.accessTracker && source === "manual" && merged.length > 0) {
