@@ -27,6 +27,9 @@ export interface SmartMemoryMetadata {
   confidence: number;
   last_accessed_at: number;
   source_session?: string;
+  /** Emotional salience score (0-1). Higher = more emotionally significant = decays slower.
+   *  Computed at store time via heuristic rules (zero LLM cost). */
+  emotional_salience: number;
   [key: string]: unknown;
 }
 
@@ -38,6 +41,7 @@ export interface LifecycleMemory {
   accessCount: number;
   createdAt: number;
   lastAccessedAt: number;
+  emotionalSalience: number;
 }
 
 function clamp01(value: unknown, fallback: number): number {
@@ -50,6 +54,70 @@ function clampCount(value: unknown, fallback = 0): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n) || n < 0) return fallback;
   return Math.floor(n);
+}
+
+// ============================================================================
+// Emotional Salience — heuristic scoring (zero LLM cost)
+// ============================================================================
+
+/** High-salience signal patterns (decisions, strong emotions, firsts, money, people) */
+const SALIENCE_BOOSTERS: Array<{ pattern: RegExp; boost: number }> = [
+  // Decisions and commitments
+  { pattern: /\b(决定|决策|confirmed|decided|commit|approved|批了|拍板|定了)\b/i, boost: 0.3 },
+  // Strong emotions
+  { pattern: /\b(震惊|惊喜|愤怒|失望|兴奋|amazing|shocked|frustrated|excited|worried|担心)\b/i, boost: 0.25 },
+  // First-time events
+  { pattern: /\b(第一次|首次|first time|first ever|从未|never before)\b/i, boost: 0.25 },
+  // Financial significance
+  { pattern: /\b(\d+万|\d+亿|\$[\d,.]+[MBK]|估值|valuation|投资|持仓)\b/i, boost: 0.2 },
+  // People and relationships
+  { pattern: /\b(Rex|KinY|苡好|光轮|东芯|砺算)\b/i, boost: 0.15 },
+  // Lessons learned / mistakes
+  { pattern: /\b(教训|踩坑|pitfall|lesson|mistake|bug|故障|挂了|崩了)\b/i, boost: 0.2 },
+  // Preferences and identity
+  { pattern: /\b(喜欢|讨厌|偏好|prefer|hate|love|always|never)\b/i, boost: 0.15 },
+  // Exclamation / emphasis (emotional weight)
+  { pattern: /[!！]{2,}|‼️|⚠️|🔴|💀/, boost: 0.1 },
+];
+
+/** Low-salience patterns (routine, technical noise) */
+const SALIENCE_DAMPENERS: Array<{ pattern: RegExp; dampen: number }> = [
+  { pattern: /\b(heartbeat|HEARTBEAT_OK)\b/i, dampen: 0.2 },
+  { pattern: /\b(cron|restart|gateway|status)\b/i, dampen: 0.1 },
+  { pattern: /\b(debug|stack trace|npm|node_modules|\.tsx?|\.jsx?)\b/i, dampen: 0.1 },
+  { pattern: /^\[?(Updated|Added|Removed|Fixed|Set)\]?\s.{0,30}$/i, dampen: 0.15 }, // short auto-generated entries only
+];
+
+/**
+ * Compute emotional salience from text + category.
+ * Returns 0-1. Higher = more emotionally charged / personally significant.
+ * Pure heuristic, no LLM call.
+ */
+export function computeEmotionalSalience(
+  text: string,
+  category?: string,
+  importance?: number,
+): number {
+  let score = 0.35; // baseline — neutral memory
+
+  // Category boost
+  if (category === "decision") score += 0.15;
+  if (category === "preference") score += 0.1;
+  if (category === "reflection") score += 0.1;
+
+  // Importance as a weak signal
+  if (typeof importance === "number" && importance > 0.8) score += 0.1;
+  if (typeof importance === "number" && importance > 0.9) score += 0.05;
+
+  // Pattern matching
+  for (const { pattern, boost } of SALIENCE_BOOSTERS) {
+    if (pattern.test(text)) score += boost;
+  }
+  for (const { pattern, dampen } of SALIENCE_DAMPENERS) {
+    if (pattern.test(text)) score -= dampen;
+  }
+
+  return Math.min(1, Math.max(0, score));
 }
 
 function normalizeTier(value: unknown): MemoryTier {
@@ -137,6 +205,10 @@ export function parseSmartMetadata(
     last_accessed_at: clampCount(parsed.last_accessed_at, timestamp),
     source_session:
       typeof parsed.source_session === "string" ? parsed.source_session : undefined,
+    emotional_salience: clamp01(
+      parsed.emotional_salience,
+      computeEmotionalSalience(text, entry.category, entry.importance),
+    ),
   };
 
   return normalized;
@@ -168,6 +240,10 @@ export function buildSmartMetadata(
       typeof patch.source_session === "string"
         ? patch.source_session
         : base.source_session,
+    emotional_salience: clamp01(
+      patch.emotional_salience ?? base.emotional_salience,
+      base.emotional_salience,
+    ),
   };
 }
 
@@ -216,6 +292,7 @@ export function toLifecycleMemory(
     accessCount: metadata.access_count,
     createdAt,
     lastAccessedAt: metadata.last_accessed_at || createdAt,
+    emotionalSalience: metadata.emotional_salience,
   };
 }
 
@@ -243,6 +320,7 @@ export function getDecayableFromEntry(
     accessCount: meta.access_count,
     createdAt,
     lastAccessedAt: meta.last_accessed_at || createdAt,
+    emotionalSalience: meta.emotional_salience,
   };
 
   return { memory, meta };

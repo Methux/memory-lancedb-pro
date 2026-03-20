@@ -78,6 +78,8 @@ export interface DecayableMemory {
   accessCount: number;
   createdAt: number;
   lastAccessedAt: number;
+  /** Emotional salience (0-1). Modulates decay: high salience = slower decay. */
+  emotionalSalience: number;
 }
 
 export interface DecayEngine {
@@ -143,16 +145,19 @@ export function createDecayEngine(
   }
 
   /**
-   * Recency: Weibull stretched-exponential decay with importance-modulated half-life.
-   * effectiveHL = halfLife * exp(mu * importance)
-   * lambda = ln(2) / effectiveHL
-   * recency = exp(-lambda * daysSince^beta)
+   * Recency: Weibull stretched-exponential decay with importance + salience modulated half-life.
+   * effectiveHL = halfLife * exp(mu * importance) * (1 + salience * 0.5)
+   *
+   * Salience effect: a memory with salience=1.0 gets 1.5x the half-life.
+   * This models the human brain's amygdala tagging: emotionally charged
+   * memories decay slower regardless of their "importance" category.
    */
   function recency(memory: DecayableMemory, now: number): number {
     const lastActive =
       memory.accessCount > 0 ? memory.lastAccessedAt : memory.createdAt;
     const daysSince = Math.max(0, (now - lastActive) / MS_PER_DAY);
-    const effectiveHL = halfLife * Math.exp(mu * memory.importance);
+    const salience = memory.emotionalSalience ?? 0.3;
+    const effectiveHL = halfLife * Math.exp(mu * memory.importance) * (1 + salience * 0.5);
     const lambda = Math.LN2 / effectiveHL;
     const beta = getTierBeta(memory.tier);
     return Math.exp(-lambda * Math.pow(daysSince, beta));
@@ -179,10 +184,13 @@ export function createDecayEngine(
   }
 
   /**
-   * Intrinsic value: importance × confidence.
+   * Intrinsic value: importance × confidence × (1 + salience * 0.3).
+   * Salience gives a mild intrinsic boost — emotionally significant memories
+   * are inherently more valuable even if importance score is moderate.
    */
   function intrinsic(memory: DecayableMemory): number {
-    return memory.importance * memory.confidence;
+    const salience = memory.emotionalSalience ?? 0.3;
+    return memory.importance * memory.confidence * (1 + salience * 0.3);
   }
 
   function scoreOne(memory: DecayableMemory, now: number): DecayScore {
