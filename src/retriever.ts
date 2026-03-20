@@ -330,24 +330,29 @@ export class MemoryRetriever {
         if (!resp.ok) return [];
         const facts = (await resp.json()) as Array<{
           fact: string; valid_at?: string; expired_at?: string; created_at?: string;
+          degree?: number;
         }>;
         // Convert Graphiti facts to RetrievalResult format (synthetic entries)
+        // Association density: degree boosts score (log scale, capped at +0.15)
         return facts
           .filter(f => f.fact && !f.expired_at) // only active facts
-          .map((f, i) => ({
-            entry: {
-              id: `graphiti-${Date.now()}-${i}`,
-              text: f.fact,
-              vector: [],
-              category: "fact" as const,
-              scope: scope,
-              importance: 0.7,
-              timestamp: f.valid_at ? new Date(f.valid_at).getTime() : Date.now(),
-              metadata: JSON.stringify({ source: "graphiti", valid_at: f.valid_at }),
-            },
-            score: 0.65 + (0.01 * (facts.length - i)), // slight ordering bias
-            sources: { graphiti: { rank: i + 1 } },
-          } as RetrievalResult));
+          .map((f, i) => {
+            const degreeBoost = f.degree ? Math.min(0.15, Math.log1p(f.degree) * 0.03) : 0;
+            return {
+              entry: {
+                id: `graphiti-${Date.now()}-${i}`,
+                text: f.fact,
+                vector: [],
+                category: "fact" as const,
+                scope: scope,
+                importance: 0.7,
+                timestamp: f.valid_at ? new Date(f.valid_at).getTime() : Date.now(),
+                metadata: JSON.stringify({ source: "graphiti", valid_at: f.valid_at, degree: f.degree }),
+              },
+              score: 0.65 + (0.01 * (facts.length - i)) + degreeBoost,
+              sources: { graphiti: { rank: i + 1 } },
+            } as RetrievalResult;
+          });
       } catch {
         return []; // Graphiti unavailable → silent fallback
       }
