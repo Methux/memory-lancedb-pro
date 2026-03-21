@@ -356,8 +356,34 @@ export class MemoryRetriever {
     }
   }
 
+  /**
+   * Strip metadata blocks from auto-recall queries.
+   * OpenClaw core may pass the full message including Conversation info,
+   * Replied message, and Sender metadata JSON blocks. We only want the
+   * actual user text for semantic search.
+   */
+  private cleanAutoRecallQuery(raw: string): string {
+    // Remove ```json ... ``` code blocks (metadata envelopes)
+    let cleaned = raw.replace(/```json[\s\S]*?```/g, "");
+    // Remove known metadata headers
+    cleaned = cleaned.replace(/Conversation info \(untrusted metadata\):/g, "");
+    cleaned = cleaned.replace(/Sender \(untrusted metadata\):/g, "");
+    cleaned = cleaned.replace(/Replied message \(untrusted, for context\):/g, "");
+    // Remove [Queued messages ...] headers
+    cleaned = cleaned.replace(/\[Queued messages[^\]]*\]/g, "");
+    cleaned = cleaned.replace(/---\s*\nQueued #\d+/g, "");
+    // Collapse whitespace
+    cleaned = cleaned.replace(/\n{3,}/g, "\n").trim();
+    // If nothing left after cleaning, return original (safety)
+    return cleaned.length > 2 ? cleaned : raw;
+  }
+
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source } = context;
+    let { query, limit, scopeFilter, category, source } = context;
+    // Clean metadata pollution from auto-recall queries
+    if (source === "auto-recall") {
+      query = this.cleanAutoRecallQuery(query);
+    }
     const safeLimit = clampInt(limit, 1, 20);
     const t0 = performance.now();
 
