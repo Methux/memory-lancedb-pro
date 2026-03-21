@@ -302,9 +302,58 @@ export class MemoryRetriever {
     this.accessTracker = tracker;
   }
 
+  /**
+   * Resonance check: fast vector probe to see if the query "resonates"
+   * with any high-salience memories. Returns true if at least one memory
+   * has cosine similarity above threshold. This mimics human associative
+   * memory — most inputs don't trigger recall, only resonant ones do.
+   */
+  private async resonanceCheck(
+    query: string,
+    scopeFilter?: string[],
+  ): Promise<boolean> {
+    try {
+      const queryVector = await this.embedder.embedQuery(query);
+      // Fast top-3 vector search with a HIGH similarity threshold
+      const RESONANCE_THRESHOLD = 0.45;
+      const probeResults = await this.store.vectorSearch(
+        queryVector,
+        3,
+        RESONANCE_THRESHOLD,
+        scopeFilter,
+      );
+      if (probeResults.length === 0) return false;
+
+      // At least one result resonates — check if it has meaningful salience
+      // (not just a random match with a low-importance peripheral memory)
+      for (const r of probeResults) {
+        const importance = r.entry.importance ?? 0.5;
+        const similarity = r.score;
+        // Resonance = strong similarity OR moderate similarity + high importance
+        if (similarity >= 0.55 || (similarity >= RESONANCE_THRESHOLD && importance >= 0.7)) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      // If resonance check fails, allow recall (fail-open)
+      return true;
+    }
+  }
+
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
+
+    // ── 共振门控：auto-recall 时先做快速共振检测 ──
+    // 只有消息与高 salience 记忆"共振"时才触发完整召回
+    // 手动 recall (memory_recall tool) 跳过门控，始终执行
+    if (source === "auto-recall") {
+      const resonates = await this.resonanceCheck(query, scopeFilter);
+      if (!resonates) {
+        return []; // 无共振 → 不注入记忆，省 token + 降噪
+      }
+    }
 
     // ── 并发查询：LanceDB + Graphiti ──
     const lanceDbPromise = (async () => {
@@ -321,23 +370,35 @@ export class MemoryRetriever {
         const graphitiBase = process.env.GRAPHITI_BASE_URL || "http://127.0.0.1:18799";
         const scope = scopeFilter?.[0] || "default";
         const groupId = scope.startsWith("agent:") ? scope.split(":")[1] || "default" : "default";
-        const resp = await fetch(`${graphitiBase}/search`, {
+
+        // Use spreading activation for auto-recall (associative memory),
+        // plain search for manual recall (targeted retrieval)
+        const useSpread = source === "auto-recall";
+        const endpoint = useSpread ? "/spread" : "/search";
+        const body = useSpread
+          ? { query, group_id: groupId, search_limit: 3, spread_depth: 1, spread_limit: 8 }
+          : { query, group_id: groupId, limit: Math.min(safeLimit, 5) };
+
+        const resp = await fetch(`${graphitiBase}${endpoint}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query, group_id: groupId, limit: Math.min(safeLimit, 5) }),
+          body: JSON.stringify(body),
           signal: AbortSignal.timeout(5000),
         });
         if (!resp.ok) return [];
+
         const facts = (await resp.json()) as Array<{
           fact: string; valid_at?: string; expired_at?: string; created_at?: string;
-          degree?: number;
+          degree?: number; source?: string;
         }>;
         // Convert Graphiti facts to RetrievalResult format (synthetic entries)
-        // Association density: degree boosts score (log scale, capped at +0.15)
+        // Spread results get slightly lower base score than direct search hits
         return facts
           .filter(f => f.fact && !f.expired_at) // only active facts
           .map((f, i) => {
+            const isSpread = f.source === "spread";
             const degreeBoost = f.degree ? Math.min(0.15, Math.log1p(f.degree) * 0.03) : 0;
+            const baseScore = isSpread ? 0.55 : 0.65; // spread results ranked slightly lower
             return {
               entry: {
                 id: `graphiti-${Date.now()}-${i}`,
@@ -347,9 +408,9 @@ export class MemoryRetriever {
                 scope: scope,
                 importance: 0.7,
                 timestamp: f.valid_at ? new Date(f.valid_at).getTime() : Date.now(),
-                metadata: JSON.stringify({ source: "graphiti", valid_at: f.valid_at, degree: f.degree }),
+                metadata: JSON.stringify({ source: isSpread ? "graphiti-spread" : "graphiti", valid_at: f.valid_at, degree: f.degree }),
               },
-              score: 0.65 + (0.01 * (facts.length - i)) + degreeBoost,
+              score: baseScore + (0.01 * (facts.length - i)) + degreeBoost,
               sources: { graphiti: { rank: i + 1 } },
             } as RetrievalResult;
           });
