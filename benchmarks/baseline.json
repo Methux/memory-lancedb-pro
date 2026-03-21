@@ -1,0 +1,16 @@
+{
+  "locomo_accuracy": 85.1,
+  "single_hop": 80.1,
+  "temporal": 76.9,
+  "multi_hop": 81.2,
+  "open_ended": 90.2,
+  "adversarial": 100,
+  "date": "2026-03-21",
+  "config": {
+    "embedding": "voyage-3-large",
+    "rerank": "rerank-2",
+    "graphiti": true,
+    "spread_limit": 8,
+    "resonance_threshold": 0.45
+  }
+}

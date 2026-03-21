@@ -15,6 +15,7 @@ import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
 import { toLifecycleMemory, getDecayableFromEntry } from "./smart-metadata.js";
 import { getAdaptiveThreshold, recordResonanceScore } from "./resonance-state.js";
+import { recordQuery } from "./query-tracker.js";
 import { appendFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -386,6 +387,16 @@ export class MemoryRetriever {
           rerankLatencyMs: 0,
         }) + "\n";
         appendFile(RETRIEVAL_LOG_PATH, trackEntry).catch(() => {});
+        recordQuery({
+          timestamp: new Date().toISOString(),
+          query: query.substring(0, 200),
+          source: (source === "auto-recall" ? "auto" : source || "manual") as "auto" | "manual" | "cli",
+          hitCount: 0,
+          topScore: resonanceTopScore,
+          latency_ms: Math.round(performance.now() - t0),
+          queryType: "gated-out",
+          resonancePass: false,
+        });
         return []; // 无共振 → 不注入记忆
       }
     }
@@ -507,6 +518,16 @@ export class MemoryRetriever {
       rerankLatencyMs: tRerankMs,
     }) + "\n";
     appendFile(RETRIEVAL_LOG_PATH, trackEntry).catch(() => {});
+    recordQuery({
+      timestamp: new Date().toISOString(),
+      query: query.substring(0, 200),
+      source: (source === "auto-recall" ? "auto" : source || "manual") as "auto" | "manual" | "cli",
+      hitCount: merged.length,
+      topScore,
+      latency_ms: Math.round(performance.now() - t0),
+      queryType: isMultiHop ? "multi-hop" : "single",
+      resonancePass: true,
+    });
 
     return merged;
   }
