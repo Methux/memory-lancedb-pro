@@ -14,6 +14,9 @@ import { filterNoise } from "./noise-filter.js";
 import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
 import { toLifecycleMemory, getDecayableFromEntry } from "./smart-metadata.js";
+import { appendFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // ============================================================================
 // Types & Configuration
@@ -287,6 +290,8 @@ function cosineSimilarity(a: number[], b: number[]): number {
 // Memory Retriever
 // ============================================================================
 
+const RETRIEVAL_LOG_PATH = join(homedir(), ".openclaw", "memory", "retrieval-log.jsonl");
+
 export class MemoryRetriever {
   private accessTracker: AccessTracker | null = null;
   private tierManager: TierManager | null = null;
@@ -344,18 +349,38 @@ export class MemoryRetriever {
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
+    const t0 = performance.now();
 
     // ── 共振门控：auto-recall 时先做快速共振检测 ──
-    // 只有消息与高 salience 记忆"共振"时才触发完整召回
-    // 手动 recall (memory_recall tool) 跳过门控，始终执行
+    let resonanceTriggered = false;
+    let resonanceTopScore = 0;
     if (source === "auto-recall") {
       const resonates = await this.resonanceCheck(query, scopeFilter);
+      resonanceTriggered = resonates;
       if (!resonates) {
-        return []; // 无共振 → 不注入记忆，省 token + 降噪
+        // Fire-and-forget tracking for gated-out queries
+        const trackEntry = JSON.stringify({
+          ts: new Date().toISOString(),
+          query: query.substring(0, 200),
+          source: source || "manual",
+          resonanceScore: 0,
+          resonanceTriggered: false,
+          lancedbCount: 0,
+          graphitiCount: 0,
+          rerankCount: 0,
+          finalCount: 0,
+          totalLatencyMs: Math.round(performance.now() - t0),
+          lancedbLatencyMs: 0,
+          graphitiLatencyMs: 0,
+          rerankLatencyMs: 0,
+        }) + "\n";
+        appendFile(RETRIEVAL_LOG_PATH, trackEntry).catch(() => {});
+        return []; // 无共振 → 不注入记忆
       }
     }
 
     // ── 并发查询：LanceDB + Graphiti ──
+    const tLance0 = performance.now();
     const lanceDbPromise = (async () => {
       if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
         return this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category);
@@ -364,6 +389,7 @@ export class MemoryRetriever {
       }
     })();
 
+    const tGraphiti0 = performance.now();
     const graphitiPromise = (async (): Promise<RetrievalResult[]> => {
       if (process.env.GRAPHITI_ENABLED !== "true") return [];
       try {
@@ -371,8 +397,6 @@ export class MemoryRetriever {
         const scope = scopeFilter?.[0] || "default";
         const groupId = scope.startsWith("agent:") ? scope.split(":")[1] || "default" : "default";
 
-        // Use spreading activation for auto-recall (associative memory),
-        // plain search for manual recall (targeted retrieval)
         const useSpread = source === "auto-recall";
         const endpoint = useSpread ? "/spread" : "/search";
         const body = useSpread
@@ -391,14 +415,12 @@ export class MemoryRetriever {
           fact: string; valid_at?: string; expired_at?: string; created_at?: string;
           degree?: number; source?: string;
         }>;
-        // Convert Graphiti facts to RetrievalResult format (synthetic entries)
-        // Spread results get slightly lower base score than direct search hits
         return facts
-          .filter(f => f.fact && !f.expired_at) // only active facts
+          .filter(f => f.fact && !f.expired_at)
           .map((f, i) => {
             const isSpread = f.source === "spread";
             const degreeBoost = f.degree ? Math.min(0.15, Math.log1p(f.degree) * 0.03) : 0;
-            const baseScore = isSpread ? 0.55 : 0.65; // spread results ranked slightly lower
+            const baseScore = isSpread ? 0.55 : 0.65;
             return {
               entry: {
                 id: `graphiti-${Date.now()}-${i}`,
@@ -415,11 +437,13 @@ export class MemoryRetriever {
             } as RetrievalResult;
           });
       } catch {
-        return []; // Graphiti unavailable → silent fallback
+        return [];
       }
     })();
 
     const [lanceResults, graphitiResults] = await Promise.all([lanceDbPromise, graphitiPromise]);
+    const tLanceMs = Math.round(performance.now() - tLance0);
+    const tGraphitiMs = Math.round(performance.now() - tGraphiti0);
 
     // Merge: LanceDB results first, append non-duplicate Graphiti facts
     const lanceTexts = new Set(lanceResults.map(r => r.entry.text.slice(0, 80)));
@@ -428,16 +452,19 @@ export class MemoryRetriever {
     );
 
     // ── 跨源统一 Rerank ──
-    // 如果有 Graphiti 结果且 rerank 可用，将两路合并后统一精排
     let merged: RetrievalResult[];
+    let rerankCount = 0;
+    const tRerank0 = performance.now();
     if (uniqueGraphiti.length > 0 && this.config.rerank !== "none" && this.config.rerankApiKey) {
       const combined = [...lanceResults, ...uniqueGraphiti];
       const queryVector = await this.embedder.embedQuery(query);
       merged = await this.rerankResults(query, queryVector, combined);
+      rerankCount = merged.length;
       merged = merged.slice(0, safeLimit);
     } else {
       merged = [...lanceResults, ...uniqueGraphiti].slice(0, safeLimit);
     }
+    const tRerankMs = Math.round(performance.now() - tRerank0);
 
     // Record access for reinforcement (manual recall only)
     if (this.accessTracker && source === "manual" && merged.length > 0) {
@@ -445,6 +472,25 @@ export class MemoryRetriever {
         merged.filter(r => !r.entry.id.startsWith("graphiti-")).map(r => r.entry.id)
       );
     }
+
+    // ── Fire-and-forget tracking log ──
+    const topScore = merged.length > 0 ? Math.max(...merged.map(r => r.score)) : 0;
+    const trackEntry = JSON.stringify({
+      ts: new Date().toISOString(),
+      query: query.substring(0, 200),
+      source: source || "manual",
+      resonanceScore: topScore,
+      resonanceTriggered,
+      lancedbCount: lanceResults.length,
+      graphitiCount: graphitiResults.length,
+      rerankCount,
+      finalCount: merged.length,
+      totalLatencyMs: Math.round(performance.now() - t0),
+      lancedbLatencyMs: tLanceMs,
+      graphitiLatencyMs: tGraphitiMs,
+      rerankLatencyMs: tRerankMs,
+    }) + "\n";
+    appendFile(RETRIEVAL_LOG_PATH, trackEntry).catch(() => {});
 
     return merged;
   }
