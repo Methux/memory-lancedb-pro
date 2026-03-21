@@ -120,6 +120,67 @@ export function computeEmotionalSalience(
   return Math.min(1, Math.max(0, score));
 }
 
+// ============================================================================
+// Emotion Calibration — rule-based post-processing for LLM valence
+// ============================================================================
+
+/** Strong emotion signal words (positive or negative) */
+const STRONG_EMOTION_PATTERNS = [
+  /太好了|太棒了|amazing|incredible|wonderful|fantastic|excellent/i,
+  /terrible|horrible|awful|disgusting|devastating/i,
+  /fuck|shit|damn|靠|卧槽|我去|妈的/i,
+  /哈哈哈|lol|lmao|rofl|😂|🤣/i,
+  /[!！]{3,}/,
+  /heartbroken|ecstatic|furious|thrilled|terrified/i,
+  /崩溃|暴怒|狂喜|绝望|震惊|兴奋死了/i,
+];
+
+/** Factual / data-heavy text indicators */
+const FACTUAL_PATTERNS = [
+  /估值|revenue|valuation|profit|loss|margin/i,
+  /[$￥€£]/,
+  /%/,
+];
+
+/**
+ * Calibrate LLM-returned emotion valence with rule-based post-processing.
+ *
+ * Fixes two common LLM failure modes:
+ * 1. Strong emotional text scored as neutral (0.4-0.6) → push toward extremes
+ * 2. Pure factual/data text scored as emotional → compress toward neutral
+ *
+ * @param text - The memory text
+ * @param rawValence - LLM-returned valence (0-1, 0.5 = neutral)
+ * @returns Calibrated valence (0-1)
+ */
+export function calibrateEmotion(text: string, rawValence: number): number {
+  if (!Number.isFinite(rawValence)) return 0.5;
+
+  // Check for strong emotion signals
+  const hasStrongEmotion = STRONG_EMOTION_PATTERNS.some(p => p.test(text));
+
+  // Check if text is factual/data-heavy
+  const digitChars = (text.match(/\d/g) || []).length;
+  const digitRatio = text.length > 0 ? digitChars / text.length : 0;
+  const hasFactualSignals = digitRatio > 0.3 || FACTUAL_PATTERNS.some(p => p.test(text));
+
+  let calibrated = rawValence;
+
+  // Fix 1: Strong emotion + neutral valence → push to 0.3 or 0.7
+  if (hasStrongEmotion && rawValence >= 0.4 && rawValence <= 0.6) {
+    // Determine direction: below 0.5 → negative, above → positive
+    calibrated = rawValence <= 0.5 ? 0.3 : 0.7;
+  }
+
+  // Fix 2: Factual text → compress to 0.45-0.55
+  if (hasFactualSignals && !hasStrongEmotion) {
+    if (calibrated < 0.45) calibrated = 0.45;
+    if (calibrated > 0.55) calibrated = 0.55;
+  }
+
+  return Math.min(1, Math.max(0, calibrated));
+}
+
 function normalizeTier(value: unknown): MemoryTier {
   switch (value) {
     case "core":
@@ -219,6 +280,15 @@ export function buildSmartMetadata(
   patch: Partial<SmartMemoryMetadata> = {},
 ): SmartMemoryMetadata {
   const base = parseSmartMetadata(entry.metadata, entry);
+  const text = entry.text ?? "";
+
+  // Calibrate emotional salience: fix LLM mis-scoring of strong emotions / factual text
+  const rawSalience = clamp01(
+    patch.emotional_salience ?? base.emotional_salience,
+    base.emotional_salience,
+  );
+  const calibratedSalience = calibrateEmotion(text, rawSalience);
+
   return {
     ...base,
     ...patch,
@@ -240,10 +310,7 @@ export function buildSmartMetadata(
       typeof patch.source_session === "string"
         ? patch.source_session
         : base.source_session,
-    emotional_salience: clamp01(
-      patch.emotional_salience ?? base.emotional_salience,
-      base.emotional_salience,
-    ),
+    emotional_salience: calibratedSalience,
   };
 }
 

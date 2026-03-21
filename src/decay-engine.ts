@@ -45,11 +45,23 @@ export interface DecayConfig {
   peripheralDecayFloor: number;
 }
 
+// NOTE: These weights are initial values pending grid-search optimization.
+// The LOCOMO benchmark results (locomo_Voyage-large_20260321_122613.json) contain
+// only question-level accuracy, not per-memory signal scores (decay, usage, emotion,
+// degree), so offline re-scoring is not feasible. To optimize:
+//   1. Instrument live retrieval to log per-memory signal scores alongside hit/miss
+//   2. Run grid search over weight space (constraint: sum = 1.0):
+//        recencyWeight:  [0.25, 0.30, 0.35, 0.40]
+//        frequencyWeight: [0.10, 0.15, 0.20, 0.25]
+//        emotionWeight (via importanceModulation): [0.05, 0.10, 0.15]
+//        degreeWeight (via tier floors): [0.05, 0.10, 0.15]
+//        intrinsicWeight: [0.10, 0.15, 0.20]
+//   3. Evaluate top-5 hit rate on accumulated retrieval logs
 export const DEFAULT_DECAY_CONFIG: DecayConfig = {
   recencyHalfLifeDays: 30,
-  recencyWeight: 0.4,
-  frequencyWeight: 0.3,
-  intrinsicWeight: 0.3,
+  recencyWeight: 0.4,       // initial — pending optimization
+  frequencyWeight: 0.3,     // initial — pending optimization
+  intrinsicWeight: 0.3,     // initial — pending optimization
   staleThreshold: 0.3,
   searchBoostMin: 0.3,
   importanceModulation: 1.5,

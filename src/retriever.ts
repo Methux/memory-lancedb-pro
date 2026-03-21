@@ -14,6 +14,7 @@ import { filterNoise } from "./noise-filter.js";
 import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
 import { toLifecycleMemory, getDecayableFromEntry } from "./smart-metadata.js";
+import { getAdaptiveThreshold, recordResonanceScore } from "./resonance-state.js";
 import { appendFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -76,6 +77,9 @@ export interface RetrievalConfig {
   /** Maximum half-life multiplier from access reinforcement.
    *  Prevents frequently accessed memories from becoming immortal. (default: 3) */
   maxHalfLifeMultiplier: number;
+  /** Enable multi-hop query routing: detected multi-hop queries skip Graphiti
+   *  spread and rely on LanceDB secondary retrieval instead. (default: true) */
+  multiHopRouting: boolean;
 }
 
 export interface RetrievalContext {
@@ -117,6 +121,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   timeDecayHalfLifeDays: 60,
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
+  multiHopRouting: true,
 };
 
 // ============================================================================
@@ -316,18 +321,22 @@ export class MemoryRetriever {
   private async resonanceCheck(
     query: string,
     scopeFilter?: string[],
-  ): Promise<boolean> {
+  ): Promise<{ resonates: boolean; topScore: number }> {
     try {
       const queryVector = await this.embedder.embedQuery(query);
-      // Fast top-3 vector search with a HIGH similarity threshold
-      const RESONANCE_THRESHOLD = 0.45;
+      const threshold = getAdaptiveThreshold();
       const probeResults = await this.store.vectorSearch(
         queryVector,
         3,
-        RESONANCE_THRESHOLD,
+        threshold,
         scopeFilter,
       );
-      if (probeResults.length === 0) return false;
+      if (probeResults.length === 0) return { resonates: false, topScore: 0 };
+
+      const topScore = Math.max(...probeResults.map(r => r.score));
+
+      // Record top score for adaptive threshold sliding window
+      recordResonanceScore(topScore);
 
       // At least one result resonates — check if it has meaningful salience
       // (not just a random match with a low-importance peripheral memory)
@@ -335,14 +344,14 @@ export class MemoryRetriever {
         const importance = r.entry.importance ?? 0.5;
         const similarity = r.score;
         // Resonance = strong similarity OR moderate similarity + high importance
-        if (similarity >= 0.55 || (similarity >= RESONANCE_THRESHOLD && importance >= 0.7)) {
-          return true;
+        if (similarity >= 0.55 || (similarity >= threshold && importance >= 0.7)) {
+          return { resonates: true, topScore };
         }
       }
-      return false;
+      return { resonates: false, topScore };
     } catch {
       // If resonance check fails, allow recall (fail-open)
-      return true;
+      return { resonates: true, topScore: 0 };
     }
   }
 
@@ -355,15 +364,17 @@ export class MemoryRetriever {
     let resonanceTriggered = false;
     let resonanceTopScore = 0;
     if (source === "auto-recall") {
-      const resonates = await this.resonanceCheck(query, scopeFilter);
+      const { resonates, topScore: probeTopScore } = await this.resonanceCheck(query, scopeFilter);
       resonanceTriggered = resonates;
+      resonanceTopScore = probeTopScore;
       if (!resonates) {
         // Fire-and-forget tracking for gated-out queries
         const trackEntry = JSON.stringify({
           ts: new Date().toISOString(),
           query: query.substring(0, 200),
           source: source || "manual",
-          resonanceScore: 0,
+          queryType: "gated-out",
+          resonanceScore: resonanceTopScore,
           resonanceTriggered: false,
           lancedbCount: 0,
           graphitiCount: 0,
@@ -378,6 +389,9 @@ export class MemoryRetriever {
         return []; // 无共振 → 不注入记忆
       }
     }
+
+    // ── Multi-hop 检测 ──
+    const isMultiHop = this.config.multiHopRouting && this.isMultiHopQuery(query);
 
     // ── 并发查询：LanceDB + Graphiti ──
     const tLance0 = performance.now();
@@ -397,7 +411,8 @@ export class MemoryRetriever {
         const scope = scopeFilter?.[0] || "default";
         const groupId = scope.startsWith("agent:") ? scope.split(":")[1] || "default" : "default";
 
-        const useSpread = source === "auto-recall";
+        // Multi-hop queries skip spread (spread follows single-entity neighborhoods)
+        const useSpread = source === "auto-recall" && !isMultiHop;
         const endpoint = useSpread ? "/spread" : "/search";
         const body = useSpread
           ? { query, group_id: groupId, search_limit: 3, spread_depth: 1, spread_limit: 8 }
@@ -479,6 +494,7 @@ export class MemoryRetriever {
       ts: new Date().toISOString(),
       query: query.substring(0, 200),
       source: source || "manual",
+      queryType: isMultiHop ? "multi-hop" : "single",
       resonanceScore: topScore,
       resonanceTriggered,
       lancedbCount: lanceResults.length,
@@ -945,7 +961,40 @@ export class MemoryRetriever {
   }
 
   /**
-   * Length normalization: penalize long entries that dominate search results
+   * Detect multi-hop queries that involve multiple entities or relationships.
+   * Multi-hop queries benefit from LanceDB secondary retrieval rather than
+   * Graphiti spread (which follows single-entity neighborhoods).
+   */
+  private isMultiHopQuery(query: string): boolean {
+    // Count distinct capitalized words (potential entity names, >= 2 chars)
+    const capitalizedWords = new Set(
+      (query.match(/\b[A-Z\u4e00-\u9fff][a-zA-Z\u4e00-\u9fff]{1,}/g) || [])
+    );
+    if (capitalizedWords.size >= 2) return true;
+
+    // Relationship / comparison patterns
+    const relationPatterns = [
+      /和.{1,20}的关系/,
+      /compared\s+to/i,
+      /difference\s+between/i,
+      /为什么/,
+      /how\s+does\s+.{1,30}\s+relate\s+to/i,
+      /between\s+.{1,30}\s+and\s+/i,
+      /相比/,
+      /区别/,
+      /之间/,
+    ];
+    for (const pat of relationPatterns) {
+      if (pat.test(query)) return true;
+    }
+
+    // Long query with question mark
+    if (query.length > 100 && /[?？]/.test(query)) return true;
+
+    return false;
+  }
+
+  /**
    * via sheer keyword density and broad semantic coverage.
    * Short, focused entries (< anchor) get a slight boost.
    * Long, sprawling entries (> anchor) get penalized.
