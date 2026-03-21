@@ -14,6 +14,8 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import type { SemanticGate } from "./semantic-gate.js";
+import { walAppend, walMarkCommitted, walMarkFailed } from "./wal-recovery.js";
 
 // ============================================================================
 // Types
@@ -38,7 +40,13 @@ export interface MemorySearchResult {
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
+  /** Enable near-duplicate detection before writing (default: true) */
+  deduplication?: boolean;
+  /** Enable semantic noise gate to filter fragments (default: true) */
+  semanticGate?: boolean;
 }
+
+const DEDUP_SIMILARITY_THRESHOLD = 0.92;
 
 export interface MetadataPatch {
   [key: string]: unknown;
@@ -181,8 +189,14 @@ export class MemoryStore {
   private initPromise: Promise<void> | null = null;
   private ftsIndexCreated = false;
   private updateQueue: Promise<void> = Promise.resolve();
+  private semanticGateInstance: SemanticGate | null = null;
 
   constructor(private readonly config: StoreConfig) { }
+
+  /** Inject a SemanticGate instance (created externally with an Embedder). */
+  setSemanticGate(gate: SemanticGate): void {
+    this.semanticGateInstance = gate;
+  }
 
   get dbPath(): string {
     return this.config.dbPath;
@@ -322,6 +336,81 @@ export class MemoryStore {
   ): Promise<MemoryEntry> {
     await this.ensureInitialized();
 
+    // ── Step 0: Semantic noise gate (before dedup) ──
+    if (this.config.semanticGate !== false && this.semanticGateInstance) {
+      try {
+        const passed = await this.semanticGateInstance.shouldPass(entry.vector, entry.text);
+        if (!passed) {
+          // Return a synthetic entry with a marker id so callers know it was filtered
+          return {
+            ...entry,
+            id: "__filtered__",
+            timestamp: Date.now(),
+            metadata: entry.metadata || "{}",
+          };
+        }
+      } catch {
+        // Gate failure → pass through
+      }
+    }
+
+    // ── Step 1: Near-duplicate detection ──
+    if (this.config.deduplication !== false && entry.vector && entry.vector.length > 0) {
+      try {
+        const scopeFilter = entry.scope ? [entry.scope] : undefined;
+        const similar = await this.vectorSearch(entry.vector, 3, 0.3, scopeFilter);
+
+        for (const match of similar) {
+          // Convert LanceDB distance-based score to cosine similarity
+          // vectorSearch returns score = 1 / (1 + distance), so:
+          // cosine_similarity ≈ 1 - distance = (2*score - 1) / score  ... but simpler:
+          // For cosine distance: similarity = 1 - distance
+          // score = 1/(1+d) → d = 1/score - 1 → similarity = 1 - d = 2 - 1/score
+          const cosineSim = 2 - 1 / match.score;
+          if (cosineSim > DEDUP_SIMILARITY_THRESHOLD) {
+            // Duplicate found — update existing entry instead of creating new
+            const existingMeta = parseSmartMetadata(match.entry.metadata, match.entry);
+            const accessCount = (existingMeta.access_count ?? 0) + 1;
+
+            const updates: {
+              text?: string;
+              importance?: number;
+              metadata?: string;
+            } = {};
+
+            // If new text is longer or importance is higher, update
+            if (entry.text.length > match.entry.text.length) {
+              updates.text = entry.text;
+            }
+            if (entry.importance > match.entry.importance) {
+              updates.importance = entry.importance;
+            }
+
+            // Always update accessCount and updatedAt
+            const patchedMeta = {
+              ...existingMeta,
+              access_count: accessCount,
+              updatedAt: Date.now(),
+            };
+            updates.metadata = stringifySmartMetadata(patchedMeta);
+
+            await this.update(match.entry.id, updates, scopeFilter);
+
+            // Return existing entry id so caller knows dedup happened
+            return {
+              ...match.entry,
+              id: match.entry.id,
+              timestamp: match.entry.timestamp,
+              metadata: updates.metadata,
+            };
+          }
+        }
+      } catch {
+        // Dedup failure → proceed with normal write
+      }
+    }
+
+    // ── Step 2: Normal write ──
     const fullEntry: MemoryEntry = {
       ...entry,
       id: randomUUID(),
@@ -339,27 +428,46 @@ export class MemoryStore {
       );
     }
 
-    // ── Graphiti 时序图谱双写（fire-and-forget）──
-    // 写入成功后异步推送到 Graphiti，失败不影响主流程
-    // 过滤低质量条目：importance < 0.5 或 text < 20字 不写 Graphiti
+    // ── Step 3: Graphiti 时序图谱双写 with WAL ──
     const textLen = (fullEntry.text || "").length;
     const importance = typeof fullEntry.importance === "number" ? fullEntry.importance : 0.7;
     if (process.env.GRAPHITI_ENABLED === "true" && importance >= 0.5 && textLen >= 20) {
       const graphitiBase = process.env.GRAPHITI_BASE_URL || "http://127.0.0.1:18799";
       const scope = fullEntry.scope || "default";
       const groupId = scope.startsWith("agent:") ? scope.split(":")[1] || "default" : "default";
+      const walTs = new Date(fullEntry.timestamp).toISOString();
+
+      // Write WAL pending entry before Graphiti call
+      walAppend({
+        ts: walTs,
+        action: "write",
+        text: fullEntry.text,
+        scope,
+        category: fullEntry.category || "fact",
+        groupId,
+        importance,
+        status: "pending",
+      }).catch(() => {});
+
+      // Async Graphiti write with WAL status tracking
       fetch(`${graphitiBase}/episodes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text: `[${fullEntry.category || "fact"}] ${fullEntry.text}`,
           group_id: groupId,
-          reference_time: new Date(fullEntry.timestamp).toISOString(),
+          reference_time: walTs,
           source: `lancedb-pro-store-${groupId}`,
           category: fullEntry.category || "fact",
         }),
         signal: AbortSignal.timeout(15000),
-      }).catch(() => {}); // 吞掉所有异常
+      })
+        .then(() => {
+          walMarkCommitted(walTs).catch(() => {});
+        })
+        .catch((err) => {
+          walMarkFailed(walTs, String(err)).catch(() => {});
+        });
     }
 
     return fullEntry;

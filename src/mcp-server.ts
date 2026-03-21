@@ -29,6 +29,8 @@ import { createEmbedder, getVectorDimensions } from "./embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./retriever.js";
 import { createScopeManager } from "./scopes.js";
 import { isNoise } from "./noise-filter.js";
+import { SemanticGate } from "./semantic-gate.js";
+import { recoverPendingWrites } from "./wal-recovery.js";
 
 // ============================================================================
 // Initialization
@@ -64,6 +66,15 @@ const retriever = createRetriever(store, embedder, {
   ...config.retrieval,
 });
 const scopeManager = createScopeManager(config.scopes);
+
+// Inject semantic gate into store
+const semanticGate = new SemanticGate(embedder);
+store.setSemanticGate(semanticGate);
+
+// WAL recovery: fire-and-forget on startup
+recoverPendingWrites().catch((err) => {
+  console.error(`memory-lancedb-pro mcp: WAL recovery failed — ${String(err)}`);
+});
 
 // ============================================================================
 // Markdown Mirror (simplified — no OpenClaw API dependency)

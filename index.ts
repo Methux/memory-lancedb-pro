@@ -38,6 +38,8 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
+import { SemanticGate } from "./src/semantic-gate.js";
+import { recoverPendingWrites } from "./src/wal-recovery.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor } from "./src/smart-extractor.js";
@@ -1636,6 +1638,15 @@ const memoryLanceDBProPlugin = {
     );
     const scopeManager = createScopeManager(config.scopes);
     const migrator = createMigrator(store);
+
+    // Inject semantic gate into store
+    const semanticGate = new SemanticGate(embedder);
+    store.setSemanticGate(semanticGate);
+
+    // WAL recovery: fire-and-forget on startup
+    recoverPendingWrites().catch((err) => {
+      api.logger.warn(`memory-lancedb-pro: WAL recovery failed — ${String(err)}`);
+    });
 
     // Initialize smart extraction
     let smartExtractor: SmartExtractor | null = null;

@@ -11,6 +11,7 @@ import type { Embedder } from "./embedder.js";
 import type { LlmClient } from "./llm-client.js";
 import {
   buildExtractionPrompt,
+  buildChineseExtractionPrompt,
   buildDedupPrompt,
   buildMergePrompt,
 } from "./extraction-prompts.js";
@@ -37,6 +38,24 @@ const SIMILARITY_THRESHOLD = 0.7;
 const MAX_SIMILAR_FOR_PROMPT = 3;
 const MAX_MEMORIES_PER_EXTRACTION = 5;
 const VALID_DECISIONS = new Set<string>(["create", "merge", "skip", "support", "contextualize", "contradict"]);
+
+// ============================================================================
+// CJK Detection
+// ============================================================================
+
+/**
+ * Detect whether a text is predominantly CJK (Chinese/Japanese/Korean).
+ * Returns true if CJK characters make up > 30% of non-whitespace characters.
+ */
+function isCjkDominant(text: string): boolean {
+  // CJK Unified Ideographs + CJK Extension A/B + CJK Compatibility + Kana + Hangul
+  const cjkRegex = /[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\uf900-\ufaff]/g;
+  const nonWhitespace = text.replace(/\s/g, "");
+  if (nonWhitespace.length === 0) return false;
+  const cjkMatches = nonWhitespace.match(cjkRegex);
+  const cjkCount = cjkMatches ? cjkMatches.length : 0;
+  return cjkCount / nonWhitespace.length > 0.3;
+}
 
 // ============================================================================
 // Smart Extractor
@@ -213,7 +232,9 @@ export class SmartExtractor {
         : conversationText;
 
     const user = this.config.user ?? "User";
-    const prompt = buildExtractionPrompt(truncated, user);
+    const prompt = isCjkDominant(truncated)
+      ? buildChineseExtractionPrompt(truncated, user)
+      : buildExtractionPrompt(truncated, user);
 
     const result = await this.llm.completeJson<{
       memories: Array<{
