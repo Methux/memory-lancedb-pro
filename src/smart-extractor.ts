@@ -749,21 +749,49 @@ export class SmartExtractor {
     scopeFilter: string[],
     contextLabel?: string,
   ): Promise<void> {
-    // 1. Record contradiction on the existing memory
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+
+    // 1. Demote + expire the contradicted memory
     const existing = await this.store.getById(matchId, scopeFilter);
     if (existing) {
       const meta = parseSmartMetadata(existing.metadata, existing);
       const supportInfo = parseSupportInfo(meta.support_info);
       const updated = updateSupportStats(supportInfo, contextLabel, "contradict");
       meta.support_info = updated;
+      meta.expired_at = nowIso;
+      meta.expired_reason = `contradicted by: ${candidate.abstract.slice(0, 120)}`;
+      meta.superseded_by_session = sessionKey;
       await this.store.update(
         matchId,
-        { metadata: stringifySmartMetadata(meta) },
+        {
+          importance: Math.max(0.05, (existing.importance ?? 0.7) * 0.2),
+          metadata: stringifySmartMetadata(meta),
+        },
         scopeFilter,
+      );
+
+      // 2. Expire in Graphiti (fire-and-forget)
+      if (process.env.GRAPHITI_ENABLED === "true") {
+        const graphitiBase = process.env.GRAPHITI_BASE_URL || "http://127.0.0.1:18799";
+        fetch(`${graphitiBase}/facts/expire`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: existing.text,
+            expired_at: nowIso,
+            reason: `contradicted: ${candidate.abstract.slice(0, 80)}`,
+          }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      }
+
+      this.log(
+        `memory-pro: smart-extractor: expired old memory ${matchId.slice(0, 8)} (imp ${(existing.importance ?? 0.7).toFixed(2)}→${Math.max(0.05, (existing.importance ?? 0.7) * 0.2).toFixed(2)})`,
       );
     }
 
-    // 2. Store the contradicting entry as a new memory
+    // 3. Store the new (contradicting) entry with supersedes relation
     const storeCategory = this.mapToStoreCategory(candidate.category);
     const metadata = stringifySmartMetadata({
       l0_abstract: candidate.abstract,
@@ -772,11 +800,15 @@ export class SmartExtractor {
       memory_category: candidate.category,
       tier: "working" as const,
       access_count: 0,
-      confidence: 0.7,
-      last_accessed_at: Date.now(),
+      confidence: 0.85,
+      last_accessed_at: now,
       source_session: sessionKey,
       contexts: contextLabel ? [contextLabel] : [],
-      relations: [{ type: "contradicts", targetId: matchId }],
+      relations: [
+        { type: "contradicts", targetId: matchId },
+        { type: "supersedes", targetId: matchId },
+      ],
+      valid_from: nowIso,
     });
 
     await this.store.store({
@@ -784,12 +816,12 @@ export class SmartExtractor {
       vector,
       category: storeCategory,
       scope: targetScope,
-      importance: this.getDefaultImportance(candidate.category),
+      importance: Math.min(1.0, this.getDefaultImportance(candidate.category) + 0.1),
       metadata,
     });
 
     this.log(
-      `memory-pro: smart-extractor: contradict [${contextLabel || "general"}] on ${matchId.slice(0, 8)}, new entry created`,
+      `memory-pro: smart-extractor: contradict [${contextLabel || "general"}] superseded ${matchId.slice(0, 8)} → new entry (imp ${(this.getDefaultImportance(candidate.category) + 0.1).toFixed(2)})`,
     );
   }
 

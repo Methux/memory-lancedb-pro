@@ -21,6 +21,101 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 // ============================================================================
+// Graphiti Graph Search Integration (3rd retrieval path)
+// ============================================================================
+
+/** Lazy-read env at call time — openclaw.json env may inject after module load. */
+function getGraphitiConfig() {
+  return {
+    enabled: process.env.GRAPHITI_ENABLED === "true",
+    baseUrl: process.env.GRAPHITI_BASE_URL || "http://127.0.0.1:18799",
+    timeoutMs: 3000,
+  };
+}
+
+interface GraphitiFact {
+  fact: string;
+  source_node?: string;
+  target_node?: string;
+  from_node?: string;
+  to_node?: string;
+  created_at?: string;
+  valid_at?: string | null;
+  score?: number | null;
+  degree?: number;
+  source?: "search" | "spread";
+}
+
+/**
+ * Query Graphiti /spread for graph-traversal results.
+ * Returns synthetic MemorySearchResult entries. Fails silently (returns []).
+ */
+async function graphitiSpreadSearch(
+  query: string,
+  groupId: string = "default",
+  searchLimit: number = 3,
+  spreadLimit: number = 3,
+): Promise<Array<MemorySearchResult & { rank: number }>> {
+  const cfg = getGraphitiConfig();
+  if (!cfg.enabled) return [];
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), cfg.timeoutMs);
+    const resp = await fetch(`${cfg.baseUrl}/spread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query,
+        group_id: groupId,
+        search_limit: searchLimit,
+        spread_depth: 1,
+        spread_limit: spreadLimit,
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!resp.ok) return [];
+
+    const facts: GraphitiFact[] = await resp.json();
+    if (!Array.isArray(facts) || facts.length === 0) return [];
+
+    const seen = new Set<string>();
+    const results: Array<MemorySearchResult & { rank: number }> = [];
+
+    for (let i = 0; i < facts.length; i++) {
+      const f = facts[i];
+      const factText = f.fact?.trim();
+      if (!factText || factText.length < 5 || seen.has(factText)) continue;
+      seen.add(factText);
+
+      const nodes = [f.source_node, f.target_node, f.from_node, f.to_node]
+        .filter(Boolean).join(" → ");
+      const text = nodes ? `[图谱] ${factText} (${nodes})` : `[图谱] ${factText}`;
+
+      const baseScore = f.source === "search" ? 0.75 : 0.45;
+      const degreeBoost = f.degree ? Math.min(0.15, Math.log1p(f.degree) * 0.02) : 0;
+
+      results.push({
+        entry: {
+          id: `graphiti-${i}-${Date.now()}`,
+          text,
+          category: "entity" as const,
+          importance: 0.8,
+          timestamp: f.created_at ? new Date(f.created_at).getTime() : Date.now(),
+          scope: "global",
+        },
+        score: Math.min(1.0, baseScore + degreeBoost),
+        rank: i + 1,
+      });
+    }
+    return results;
+  } catch {
+    return []; // Silent fallback
+  }
+}
+
+// ============================================================================
 // Types & Configuration
 // ============================================================================
 
@@ -96,6 +191,7 @@ export interface RetrievalResult extends MemorySearchResult {
   sources: {
     vector?: { score: number; rank: number };
     bm25?: { score: number; rank: number };
+    graphiti?: { score: number; rank: number };
     fused?: { score: number };
     reranked?: { score: number };
   };
@@ -378,6 +474,51 @@ export class MemoryRetriever {
     return cleaned.length > 2 ? cleaned : raw;
   }
 
+  /**
+   * Expand date expressions in query to multiple formats for BM25 matching.
+   * "3月17日" → "3月17日 3/17 03-17 2026-03-17"
+   * "2026年3月17日" → "2026年3月17日 3/17 2026-03-17 03-17"
+   * "昨天/前天/上周" → resolved to absolute dates
+   */
+  private expandDateFormats(query: string): string {
+    const now = new Date();
+    const year = now.getFullYear();
+    let expanded = query;
+
+    // Pattern: X月Y日 or X月Y号
+    expanded = expanded.replace(/(\d{1,2})月(\d{1,2})[日号]/g, (match, m, d) => {
+      const mm = String(m).padStart(2, "0");
+      const dd = String(d).padStart(2, "0");
+      return `${match} ${m}/${d} ${year}-${mm}-${dd} ${mm}-${dd}`;
+    });
+
+    // Pattern: YYYY年X月Y日
+    expanded = expanded.replace(/(\d{4})年(\d{1,2})月(\d{1,2})[日号]/g, (match, y, m, d) => {
+      const mm = String(m).padStart(2, "0");
+      const dd = String(d).padStart(2, "0");
+      return `${match} ${m}/${d} ${y}-${mm}-${dd} ${mm}-${dd}`;
+    });
+
+    // Pattern: X.Y or X/Y (might be dates like 3/17)
+    // Don't expand — these are already BM25-friendly
+
+    // Relative dates
+    const relMap: Record<string, number> = {
+      "今天": 0, "昨天": -1, "前天": -2, "大前天": -3,
+    };
+    for (const [word, offset] of Object.entries(relMap)) {
+      if (expanded.includes(word)) {
+        const d = new Date(now.getTime() + offset * 86400000);
+        const iso = d.toISOString().slice(0, 10);
+        const m = d.getMonth() + 1;
+        const day = d.getDate();
+        expanded = expanded.replace(word, `${word} ${iso} ${m}/${day} ${m}月${day}日`);
+      }
+    }
+
+    return expanded;
+  }
+
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     let { query, limit, scopeFilter, category, source } = context;
     // Clean metadata pollution from auto-recall queries
@@ -452,7 +593,7 @@ export class MemoryRetriever {
         const useSpread = source === "auto-recall" && !isMultiHop;
         const endpoint = useSpread ? "/spread" : "/search";
         const body = useSpread
-          ? { query, group_id: groupId, search_limit: 3, spread_depth: 1, spread_limit: 8 }
+          ? { query, group_id: groupId, search_limit: 3, spread_depth: 1, spread_limit: 3 }
           : { query, group_id: groupId, limit: Math.min(safeLimit, 5) };
 
         const resp = await fetch(`${graphitiBase}${endpoint}`, {
@@ -472,7 +613,7 @@ export class MemoryRetriever {
           .map((f, i) => {
             const isSpread = f.source === "spread";
             const degreeBoost = f.degree ? Math.min(0.15, Math.log1p(f.degree) * 0.03) : 0;
-            const baseScore = isSpread ? 0.55 : 0.65;
+            const baseScore = isSpread ? 0.45 : 0.65;
             return {
               entry: {
                 id: `graphiti-${Date.now()}-${i}`,
@@ -503,18 +644,18 @@ export class MemoryRetriever {
       r => !lanceTexts.has(r.entry.text.slice(0, 80))
     );
 
-    // ── 跨源统一 Rerank ──
+    // ── 跨源统一 Rerank（所有结果都过 reranker）──
     let merged: RetrievalResult[];
     let rerankCount = 0;
     const tRerank0 = performance.now();
-    if (uniqueGraphiti.length > 0 && this.config.rerank !== "none" && this.config.rerankApiKey) {
-      const combined = [...lanceResults, ...uniqueGraphiti];
+    const combined = [...lanceResults, ...uniqueGraphiti];
+    if (this.config.rerank !== "none" && this.config.rerankApiKey && combined.length > 0) {
       const queryVector = await this.embedder.embedQuery(query);
       merged = await this.rerankResults(query, queryVector, combined);
       rerankCount = merged.length;
       merged = merged.slice(0, safeLimit);
     } else {
-      merged = [...lanceResults, ...uniqueGraphiti].slice(0, safeLimit);
+      merged = combined.slice(0, safeLimit);
     }
     const tRerankMs = Math.round(performance.now() - tRerank0);
 
@@ -617,8 +758,8 @@ export class MemoryRetriever {
     // Compute query embedding once, reuse for vector search + reranking
     const queryVector = await this.embedder.embedQuery(query);
 
-    // Run vector and BM25 searches in parallel
-    const [vectorResults, bm25Results] = await Promise.all([
+    // Run vector, BM25, and Graphiti searches in parallel (3-way)
+    const [vectorResults, bm25Results, graphitiResults] = await Promise.all([
       this.runVectorSearch(
         queryVector,
         candidatePoolSize,
@@ -626,10 +767,12 @@ export class MemoryRetriever {
         category,
       ),
       this.runBM25Search(query, candidatePoolSize, scopeFilter, category),
+      graphitiSpreadSearch(query, "default", 3, 3),
     ]);
 
     // Fuse results using RRF (async: validates BM25-only entries exist in store)
-    const fusedResults = await this.fuseResults(vectorResults, bm25Results);
+    // Graphiti results merged as 3rd signal
+    const fusedResults = await this.fuseResults(vectorResults, bm25Results, graphitiResults);
 
     // Apply minimum score threshold
     const filtered = fusedResults.filter(
@@ -704,7 +847,9 @@ export class MemoryRetriever {
     scopeFilter?: string[],
     category?: string,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.bm25Search(query, limit, scopeFilter);
+    // Expand date formats for better BM25 matching
+    const expandedQuery = this.expandDateFormats(query);
+    const results = await this.store.bm25Search(expandedQuery, limit, scopeFilter);
 
     // Filter by category if specified
     const filtered = category
@@ -720,6 +865,7 @@ export class MemoryRetriever {
   private async fuseResults(
     vectorResults: Array<MemorySearchResult & { rank: number }>,
     bm25Results: Array<MemorySearchResult & { rank: number }>,
+    graphitiResults: Array<MemorySearchResult & { rank: number }> = [],
   ): Promise<RetrievalResult[]> {
     // Create maps for quick lookup
     const vectorMap = new Map<string, MemorySearchResult & { rank: number }>();
@@ -792,6 +938,20 @@ export class MemoryRetriever {
       });
     }
 
+    // Inject Graphiti graph traversal results as 3rd signal.
+    // Synthetic entries (not in LanceDB) — scored slightly lower to avoid dominating,
+    // but provide coverage for relational queries (e.g. "光轮的客户", "Rex投了什么").
+    for (const gr of graphitiResults) {
+      fusedResults.push({
+        entry: gr.entry,
+        score: gr.score * 0.85,
+        sources: {
+          graphiti: { score: gr.score, rank: gr.rank },
+          fused: { score: gr.score * 0.85 },
+        },
+      });
+    }
+
     // Sort by fused score descending
     return fusedResults.sort((a, b) => b.score - a.score);
   }
@@ -810,6 +970,7 @@ export class MemoryRetriever {
     }
 
     // Try cross-encoder rerank via configured provider API
+    console.warn(`[rerank-debug] rerank=${this.config.rerank}, hasKey=${!!this.config.rerankApiKey}, keyPrefix=${String(this.config.rerankApiKey || '').substring(0, 8)}, provider=${this.config.rerankProvider}, model=${this.config.rerankModel}`);
     if (this.config.rerank === "cross-encoder" && this.config.rerankApiKey) {
       try {
         const provider = this.config.rerankProvider || "jina";

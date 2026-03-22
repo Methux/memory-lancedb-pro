@@ -61,6 +61,8 @@ const embedder = createEmbedder({
   taskPassage: config.embedding.taskPassage,
   normalized: config.embedding.normalized,
 });
+console.warn(`[config-debug] config.retrieval keys: ${JSON.stringify(Object.keys(config.retrieval || {}))}`);
+console.warn(`[config-debug] config.retrieval.rerankApiKey: ${config.retrieval?.rerankApiKey ? 'SET(' + String(config.retrieval.rerankApiKey).substring(0, 8) + ')' : 'EMPTY'}`);
 const retriever = createRetriever(store, embedder, {
   ...DEFAULT_RETRIEVAL_CONFIG,
   ...config.retrieval,

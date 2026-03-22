@@ -1627,13 +1627,16 @@ const memoryLanceDBProPlugin = {
       ...DEFAULT_TIER_CONFIG,
       ...(config.tier || {}),
     });
+    const mergedRetrievalConfig = {
+      ...DEFAULT_RETRIEVAL_CONFIG,
+      ...config.retrieval,
+    };
+    console.warn(`[rerank-init] rerank=${mergedRetrievalConfig.rerank}, hasKey=${!!mergedRetrievalConfig.rerankApiKey}, provider=${mergedRetrievalConfig.rerankProvider}, model=${mergedRetrievalConfig.rerankModel}, endpoint=${mergedRetrievalConfig.rerankEndpoint}`);
+    console.warn(`[rerank-init] config.retrieval keys: ${JSON.stringify(Object.keys(config.retrieval || {}))}`);
     const retriever = createRetriever(
       store,
       embedder,
-      {
-        ...DEFAULT_RETRIEVAL_CONFIG,
-        ...config.retrieval,
-      },
+      mergedRetrievalConfig,
       { decayEngine },
     );
     const scopeManager = createScopeManager(config.scopes);
