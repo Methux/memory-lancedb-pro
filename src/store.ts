@@ -47,6 +47,7 @@ export interface StoreConfig {
 }
 
 const DEDUP_SIMILARITY_THRESHOLD = 0.92;
+const CONFLICT_SIMILARITY_THRESHOLD = 0.70;
 
 export interface MetadataPatch {
   [key: string]: unknown;
@@ -407,6 +408,52 @@ export class MemoryStore {
         }
       } catch {
         // Dedup failure → proceed with normal write
+      }
+    }
+
+    // ── Step 1b: Conflict detection (mid-similarity range) ──
+    // If the new entry is similar but not identical to an existing one,
+    // check if it's a contradiction/update and demote the old entry.
+    // Search without scope filter to catch conflicts across scopes.
+    if (this.config.deduplication !== false && entry.vector && entry.vector.length > 0) {
+      try {
+        const similar = await this.vectorSearch(entry.vector, 3, 0.3);
+
+        for (const match of similar) {
+          const cosineSim = 2 - 1 / match.score;
+          if (cosineSim > CONFLICT_SIMILARITY_THRESHOLD && cosineSim <= DEDUP_SIMILARITY_THRESHOLD) {
+            // Mid-range similarity: might be a contradiction or update
+            // Heuristic: if both texts are about the same topic but have different
+            // values/numbers/states, it's likely a contradiction
+            const oldText = match.entry.text || "";
+            const newText = entry.text || "";
+
+            // Quick contradiction signals:
+            // 1. Both mention the same entity but with different numbers
+            // 2. Negation patterns (不/没/no/not + similar keywords)
+            // 3. New text explicitly says "changed to" / "改成" / "updated"
+            const hasContradictionSignal =
+              /改成|变成|更新为|换成|不再|取消了|changed to|updated to|no longer|switched to/i.test(newText) ||
+              (oldText.match(/\d+/) && newText.match(/\d+/) && cosineSim > 0.80);
+
+            if (hasContradictionSignal) {
+              // Demote old entry
+              const existingMeta = parseSmartMetadata(match.entry.metadata, match.entry);
+              const oldImportance = match.entry.importance ?? 0.7;
+              existingMeta.expired_at = new Date().toISOString();
+              existingMeta.expired_reason = `superseded: ${newText.slice(0, 80)}`;
+              await this.update(
+                match.entry.id,
+                {
+                  importance: Math.max(0.05, oldImportance * 0.1),
+                  metadata: stringifySmartMetadata(existingMeta),
+                },
+              );
+            }
+          }
+        }
+      } catch {
+        // Conflict check failure → proceed with normal write
       }
     }
 
